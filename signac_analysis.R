@@ -16,7 +16,7 @@ suppressPackageStartupMessages({
 
 args <- commandArgs(trailingOnly = TRUE)
 if(length(args) < 4) {
-    stop("Usage: Rscript signac.R <fragments.tsv.gz> <sample_name> <output_dir> <bin_tissue_barcode.csv> [threads] [memory_gb]")
+    stop("Usage: Rscript signac.R <fragments.tsv.gz> <sample_name> <output_dir> <bin_tissue_barcode.csv> [threads] [memory_gb] [genome]")
 }
 
 fragpath <- args[1]
@@ -35,8 +35,11 @@ parse_positive_int <- function(value, default_value) {
 WORKERS <- if(length(args) >= 5) parse_positive_int(args[5], 8) else 8
 MEM_GB <- if(length(args) >= 6) parse_positive_int(args[6], 64) else 64
 MAX_MEM <- MEM_GB * 1024^3
-GENOME <- "mm10"
-plan("multisession", workers = WORKERS) 
+GENOME <- if(length(args) >= 7 && nzchar(args[7])) args[7] else "mm10"
+if(!(GENOME %in% c("mm10", "hg38"))) {
+    stop(sprintf("Unsupported genome '%s'; expected one of: mm10, hg38", GENOME))
+}
+plan("multisession", workers = WORKERS)
 options(future.globals.maxSize = MAX_MEM)
 
 pal <- c('#D51F26', '#272E6A', '#208A42', '#89288F', '#F47D2B', 
@@ -111,18 +114,22 @@ seqlevels(annotations) <- paste0('chr', seqlevels(annotations))
 genome(annotations) <- GENOME
 Annotation(pbmc) <- annotations
 
-other_ids <- rownames(pbmc@meta.data)
-pbmc$coor_x <- as.numeric(sapply(other_ids,function(x){strsplit(x,'_')[[1]][1]}))
-pbmc$coor_y <- as.numeric(sapply(other_ids,function(x){strsplit(x,'_')[[1]][2]}))
+cell_barcodes <- rownames(pbmc@meta.data)
+pbmc$coor_x <- as.numeric(sapply(cell_barcodes, function(x) strsplit(x, "_")[[1]][1]))
+pbmc$coor_y <- as.numeric(sapply(cell_barcodes, function(x) strsplit(x, "_")[[1]][2]))
 
 
-counts_vector <- barcode_table$nFrags
-names(counts_vector) <- barcode_table$CB
-pbmc$nFrags <- counts_vector[Cells(pbmc)]
+# nFrags already computed upstream (compute_tissue_barcodes.py, chrM excluded).
+# We pass it through metadata rather than recomputing it from the fragment file.
+pbmc$nFrags <- barcode_table$nFrags[match(Cells(pbmc), barcode_table$CB)]
 pbmc$nFrags[is.na(pbmc$nFrags)] <- 0
 
 pbmc <- subset(pbmc, subset = nCount_ATAC > 10)
 pbmc <- FRiP(object = pbmc, assay = 'ATAC', total.fragments = 'nFrags')
+
+# The chromatin assay holds references to the (heavy) counts matrix + fragment
+# object; once they're inside pbmc we no longer need the bare versions.
+rm(counts, chrom_assay, frags); gc(verbose = FALSE)
 
 pbmc <- RunTFIDF(pbmc)
 pbmc <- FindTopFeatures(pbmc, min.cutoff = 20)
@@ -144,67 +151,58 @@ pbmc <- RunSVD(pbmc, n = n_svd)
 pbmc <- RunUMAP(pbmc, dims = dims_to_use, reduction = 'lsi')
 pbmc <- FindNeighbors(object = pbmc, dims = dims_to_use, reduction = 'lsi')
 
-resolutions <- c(0.4, 0.6, 0.8, 1.0, 1.2)
-message(sprintf("[Signac] Clustering with resolutions: %s", paste(resolutions, collapse=", ")))
+message("[Signac] Clustering at resolution 0.8")
 
 default_assay <- DefaultAssay(pbmc)
 message(sprintf("[Signac] Default assay: %s", default_assay))
 
-for (res in resolutions) {
-    res_str <- gsub("\\.", "_", as.character(res))
-    cluster_col <- paste0(default_assay, "_snn_res.", res)
+res <- 0.8
+res_str <- gsub("\\.", "_", as.character(res))
+cluster_col <- paste0(default_assay, "_snn_res.", res)
 
-    tryCatch({
-        pbmc <- FindClusters(object = pbmc, algorithm = 3, resolution = res, verbose = FALSE)
-        pbmc[[paste0("clusters_res_", res_str)]] <- Idents(pbmc)
+tryCatch({
+    pbmc <- FindClusters(object = pbmc, algorithm = 3, resolution = res, verbose = FALSE)
+    pbmc[[paste0("clusters_res_", res_str)]] <- Idents(pbmc)
 
-        if (!cluster_col %in% colnames(pbmc@meta.data)) {
-            alt_col <- "seurat_clusters"
-            if (alt_col %in% colnames(pbmc@meta.data)) {
-                cluster_col <- alt_col
-                message(sprintf("[Signac] Warning: Using fallback column '%s' for res=%s", cluster_col, res))
-            } else {
-                stop(sprintf("Cluster column '%s' not found in metadata", cluster_col))
-            }
-        }
-
-        Idents(pbmc) <- cluster_col
-
-        n_clusters <- length(unique(Idents(pbmc)))
-        if (n_clusters > length(pal)) {
-            cluster_pal <- hcl(
-                h = seq(15, 375, length.out = n_clusters + 1)[1:n_clusters],
-                c = 100, l = 65
-            )
+    if (!cluster_col %in% colnames(pbmc@meta.data)) {
+        alt_col <- "seurat_clusters"
+        if (alt_col %in% colnames(pbmc@meta.data)) {
+            cluster_col <- alt_col
+            message(sprintf("[Signac] Warning: Using fallback column '%s' for res=%s", cluster_col, res))
         } else {
-            cluster_pal <- pal[1:n_clusters]
+            stop(sprintf("Cluster column '%s' not found in metadata", cluster_col))
         }
+    }
 
-        p_umap <- DimPlot(pbmc, label = TRUE, cols = cluster_pal, pt.size = 0.1, reduction = "umap")
-        p_spatial <- ggplot() +
-            geom_tile(data = pbmc@meta.data,
-                      aes(x = coor_x, y = coor_y, fill = .data[[cluster_col]])) +
-            scale_fill_manual(values = cluster_pal) +
-            theme_void() +
-            coord_fixed() +
-            theme(text = element_text(size = 16))
+    Idents(pbmc) <- cluster_col
 
-        cluster_plot <- p_umap + p_spatial
-        plot_file <- file.path(outdir, paste0(sample_name, "_clusters_res", res_str, ".svg"))
-        ggsave(plot_file, cluster_plot, width = 12, height = 6, device = "svg")
-        message(sprintf("[Signac] Cluster plot (res=%s): %s", res, plot_file))
+    n_clusters <- length(unique(Idents(pbmc)))
+    # Always use colorRampPalette so the palette gracefully extends past the
+    # hand-picked colours when cluster count grows (no implicit upper bound).
+    cluster_pal <- colorRampPalette(pal)(n_clusters)
 
-    }, error = function(e) {
-        message(sprintf("[Signac] Warning: Failed to generate cluster plot for res=%s: %s", res, e$message))
-        blank_plot <- ggplot() +
-            annotate("text", x = 0.5, y = 0.5, label = sprintf("Plot failed\nres=%s", res)) +
-            theme_void()
-        plot_file <- file.path(outdir, paste0(sample_name, "_clusters_res", res_str, ".svg"))
-        ggsave(plot_file, blank_plot, width = 6, height = 6, device = "svg")
-    })
-}
+    p_umap <- DimPlot(pbmc, label = TRUE, cols = cluster_pal, pt.size = 0.1, reduction = "umap")
+    p_spatial <- ggplot() +
+        geom_tile(data = pbmc@meta.data,
+                  aes(x = coor_x, y = coor_y, fill = .data[[cluster_col]])) +
+        scale_fill_manual(values = cluster_pal) +
+        theme_void() +
+        coord_fixed() +
+        theme(text = element_text(size = 16))
 
-pbmc <- FindClusters(object = pbmc, algorithm = 3, resolution = 0.8, verbose = FALSE)
+    cluster_plot <- p_umap + p_spatial
+    plot_file <- file.path(outdir, paste0(sample_name, "_clusters_res", res_str, ".svg"))
+    ggsave(plot_file, cluster_plot, width = 12, height = 6, device = "svg")
+    message(sprintf("[Signac] Cluster plot (res=%s): %s", res, plot_file))
+
+}, error = function(e) {
+    message(sprintf("[Signac] Warning: Failed to generate cluster plot for res=%s: %s", res, e$message))
+    blank_plot <- ggplot() +
+        annotate("text", x = 0.5, y = 0.5, label = sprintf("Plot failed\nres=%s", res)) +
+        theme_void()
+    plot_file <- file.path(outdir, paste0(sample_name, "_clusters_res", res_str, ".svg"))
+    ggsave(plot_file, blank_plot, width = 6, height = 6, device = "svg")
+})
 
 
 ns_result <- tryCatch({
@@ -226,7 +224,8 @@ tss_result <- tryCatch({
 if (!is.null(tss_result)) pbmc <- tss_result
 
 bl_result <- tryCatch({
-    pbmc$blacklist_ratio <- FractionCountsInRegion(object = pbmc,regions = blacklist_mm10)
+    blacklist_regions <- if (GENOME == "hg38") Signac::blacklist_hg38_unified else Signac::blacklist_mm10
+    pbmc$blacklist_ratio <- FractionCountsInRegion(object = pbmc, regions = blacklist_regions)
     pbmc
 }, error = function(e) {
     message("[Signac] Warning: Blacklist ratio calculation failed: ", e$message)
@@ -279,17 +278,19 @@ tryCatch({
 })
 
 tryCatch({
+    # ggPoint() opens a graphics device as a side effect; pdf(NULL) + dev.off()
+    # absorbs the implicit PDF so the working directory stays clean.
     pdf(NULL)
     p5 <- ggPoint(
-        x = log10(pbmc@meta.data$nFrags), 
-        y = pbmc@meta.data$TSS.enrichment, 
+        x = log10(pbmc@meta.data$nFrags),
+        y = pbmc@meta.data$TSS.enrichment,
         colorDensity = TRUE,
         continuousSet = "sambaNight",
         xlabel = "Log10 Unique Fragments",
         ylabel = "TSS Enrichment",
         xlim = c(log10(500), quantile(log10(pbmc@meta.data$nFrags), probs = 0.99, na.rm = TRUE)),
         ylim = c(0, quantile(pbmc@meta.data$TSS.enrichment, probs = 0.99, na.rm = TRUE))
-    ) + 
+    ) +
     theme(
         legend.position = "bottom",
         legend.justification = "center"
@@ -303,12 +304,15 @@ tryCatch({
     ggsave(file.path(outdir, paste0(sample_name, "_tss_scatter.svg")), blank, width = 6, height = 6, device = "svg")
 })
 
+# Fragment size distribution: data is consumed by render_final_report.py via
+# ECharts (responsive to container size), so we emit CSV + JS data files only —
+# no static SVG (the previous SVG distorted at non-default aspect ratios).
 threads <- WORKERS
-cmd <- paste0("pigz -dc -p ", threads, " ", fragpath, 
+cmd <- paste0("pigz -dc -p ", threads, " ", fragpath,
   " | awk '$1 != \"chrM\" && $3-$2 <= 750 && $3-$2 > 0 { counts[$3-$2]++ } END { for (i=1; i<=750; i++) print i, counts[i]+0 }'")
 size_df <- fread(cmd = cmd, col.names = c("size", "count"))
 size_df[, percentage := (count / sum(count)) * 100]
-write.csv(size_df, file.path(outdir, paste0(sample_name, "_fragment_size.csv")))
+write.csv(size_df, file.path(outdir, paste0(sample_name, "_fragment_size.csv")), row.names = FALSE)
 nfrags_total <- sum(size_df$count)
 nfrags_nfr <- sum(size_df[size < 147]$count)
 nfrags_mono <- sum(size_df[size >= 147 & size < 294]$count)
@@ -323,32 +327,7 @@ js_data <- paste0(
   "];"
 )
 
-writeLines(js_data, file.path(outdir, "fragment_data.js"))
-
-p6 <- ggplot(size_df, aes(x = size, y = percentage)) +
-  geom_line(color = "#1f77b4", linewidth = 1) + 
-  geom_area(fill = "#1f77b4", alpha = 0.1) + 
-  scale_x_continuous(breaks = seq(0, 750, 150), limits = c(0, 750)) +
-  labs(
-    x = "Fragment Size (bp)",
-    y = "Percentage of Fragments (%)"
-  ) +
-  theme_bw() +
-  theme(
-    panel.border = element_rect(color = "black", fill = NA, linewidth =1), 
-    panel.grid = element_blank(), 
-    axis.text = element_text(color = "black"),
-    axis.ticks = element_line(color = "black")
-  )
-p6_formatted <- p6+theme(text=element_text(size=16))
-tryCatch({
-    ggsave(file.path(outdir, paste0(sample_name, "_fragment_size.svg")), p6_formatted, width = 8, height = 5, device = "svg")
-    message("[Signac] Fragment size plot saved")
-}, error = function(e) {
-    message("[Signac] Warning: Fragment size plot failed: ", e$message)
-    blank <- ggplot() + annotate("text", x=0.5, y=0.5, label="Fragment size plot failed") + theme_void()
-    ggsave(file.path(outdir, paste0(sample_name, "_fragment_size.svg")), blank, width = 8, height = 5, device = "svg")
-})
+writeLines(js_data, file.path(outdir, paste0(sample_name, "_fragment_data.js")))
 
 tryCatch({
     p7 <- ggplot()+
@@ -433,7 +412,9 @@ message(sprintf("[Signac] Analysis complete! Results saved to: %s", outdir))
 message(sprintf("[Signac] - Peaks: %s", file.path(outdir, paste0(sample_name, "_peaks.rds"))))
 message(sprintf("[Signac] - QC violin: %s", file.path(outdir, paste0(sample_name, "_qc_violin.svg"))))
 message(sprintf("[Signac] - TSS scatter: %s", file.path(outdir, paste0(sample_name, "_tss_scatter.svg"))))
-message(sprintf("[Signac] - Fragment size: %s", file.path(outdir, paste0(sample_name, "_fragment_size.svg"))))
+message(sprintf("[Signac] - Fragment size data: %s (CSV) + %s (JS)",
+        file.path(outdir, paste0(sample_name, "_fragment_size.csv")),
+        file.path(outdir, paste0(sample_name, "_fragment_data.js"))))
 message(sprintf("[Signac] - Spatial QC: %s", file.path(outdir, paste0(sample_name, "_spatial_qc.svg"))))
-message(sprintf("[Signac] - Cluster plots (multi-res): %s_clusters_res*.svg", file.path(outdir, sample_name)))
+message(sprintf("[Signac] - Cluster plot (res=0.8): %s", file.path(outdir, paste0(sample_name, "_clusters_res0_8.svg"))))
 message(sprintf("[Signac] - Seurat object: %s", file.path(outdir, paste0(sample_name, "_filtered_seurat_object.rds"))))

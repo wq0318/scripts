@@ -19,15 +19,24 @@ def main() -> int:
     with open(report_file, "r", encoding="utf-8", errors="replace") as handle:
         content = handle.read().strip()
 
-    if content.startswith("{"):
-        loaded = json.loads(content)
-        parsed = {key: str(value) for key, value in loaded.items()}
-    else:
-        for line in content.splitlines():
+    def parse_kv(text: str) -> dict[str, str]:
+        kv: dict[str, str] = {}
+        for line in text.splitlines():
             line = line.strip()
             if ":" in line:
                 key, value = line.split(":", 1)
-                parsed[key.strip()] = value.strip()
+                kv[key.strip()] = value.strip()
+        return kv
+
+    if content.startswith("{"):
+        try:
+            loaded = json.loads(content)
+            parsed = {key: str(value) for key, value in loaded.items()}
+        except json.JSONDecodeError as exc:
+            print(f"[WARN] JSON parse failed ({exc}); falling back to KV parser: {report_file}", file=sys.stderr)
+            parsed = parse_kv(content)
+    else:
+        parsed = parse_kv(content)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     mapping = {

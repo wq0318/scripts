@@ -8,6 +8,7 @@ import csv
 import html
 import json
 import os
+import sys
 from collections import defaultdict
 from pathlib import Path
 from urllib.parse import quote
@@ -54,6 +55,23 @@ def read_saturation_table(path: str) -> list[dict[str, float]]:
                 })
             except ValueError:
                 continue
+    return rows
+
+
+def read_fragment_size_csv(path: str) -> list[dict[str, float]]:
+    """Read signac_analysis.R's `_fragment_size.csv` and return ECharts-friendly rows."""
+    if not path or not os.path.exists(path):
+        return []
+    rows: list[dict[str, float]] = []
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                size = int(float(row["size"]))
+                percentage = float(row["percentage"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows.append({"size": size, "percentage": round(percentage, 4)})
     return rows
 
 
@@ -234,8 +252,7 @@ def render_section2_saturation(saturation_per_bin: dict[str, list[dict[str, floa
     """
 
 
-def render_section3_fragment(bin_labels: list[str], bin_metrics_map: dict[str, tuple[dict[str, str], dict[str, str]]],
-                              fragment_size_images: dict[str, str]) -> str:
+def render_section3_fragment(bin_labels: list[str], bin_metrics_map: dict[str, tuple[dict[str, str], dict[str, str]]]) -> str:
     primary = bin_labels[0]
     _, ns = bin_metrics_map[primary]
     nfr = format_num(ns.get("fraction_nfr", "0"), suffix="%")
@@ -255,7 +272,7 @@ def render_section3_fragment(bin_labels: list[str], bin_metrics_map: dict[str, t
         </div>
         <div class="chart-card" style="flex: 1;">
             <span class="chart-title">Insert Size Distribution</span>
-            <img class="full-img" src="{fragment_size_images[primary]}" alt="{primary} fragment size" />
+            <div id="fragmentChartOverview" class="chart-container"></div>
         </div>
     </div>
     """
@@ -264,7 +281,7 @@ def render_section3_fragment(bin_labels: list[str], bin_metrics_map: dict[str, t
 def render_section4_downstream(bin_labels: list[str],
                                 bin_metrics_map: dict[str, tuple[dict[str, str], dict[str, str]]],
                                 bin_images: dict[str, dict[str, str]],
-                                cluster_map: dict[str, dict[str, str]]) -> str:
+                                cluster_map: dict[str, str]) -> str:
     header = "".join([
         "<th>Resolution</th>",
         "<th>Total spots</th>",
@@ -299,13 +316,9 @@ def render_section4_downstream(bin_labels: list[str],
     )
 
     tab_contents = []
-    resolutions = ["0.4", "0.6", "0.8", "1.0", "1.2"]
     for i, bl in enumerate(bin_labels):
         active_cls = " active" if i == 0 else ""
         images = bin_images[bl]
-        cluster_entries = ", ".join(
-            f'"{res}": "{cluster_map[bl].get(res, "")}"' for res in resolutions
-        )
         tab_contents.append(f"""
         <div class="tab-content{active_cls}" id="{bl}-content">
             <div class="bin-toolbar">
@@ -326,23 +339,14 @@ def render_section4_downstream(bin_labels: list[str],
 
             <div class="chart-grid" style="margin-top: 20px;">
                 <div class="chart-card"><span class="chart-title">QC Violin Plots</span><img class="full-img" src="{images['qc']}" alt="{bl} qc violin" /></div>
-                <div class="chart-card"><span class="chart-title">Fragment Size</span><img class="full-img" src="{images['fragment']}" alt="{bl} fragment size" /></div>
+                <div class="chart-card"><span class="chart-title">Fragment Size</span><div id="fragmentChart_{bl}" class="chart-container"></div></div>
             </div>
 
             <div class="cluster-control-panel">
-                <div class="slider-box">
-                    <strong>Cluster Resolution:</strong>
-                    <input type="range" class="res-slider" min="0" max="4" step="1" value="2" data-bin="{bl}" aria-label="{bl} cluster resolution" />
-                    <span class="res-val" data-bin="{bl}">0.8</span>
-                </div>
                 <div class="chart-card cluster-canvas">
-                    <span class="chart-title">UMAP + Spatial Clusters</span>
-                    <img class="full-img cluster-img" data-bin="{bl}" src="{cluster_map[bl].get('0.8', '')}" alt="{bl} cluster" />
+                    <span class="chart-title">UMAP + Spatial Clusters (res=0.8)</span>
+                    <img class="full-img" src="{cluster_map[bl]}" alt="{bl} cluster res=0.8" />
                 </div>
-                <script>
-                  window.__clusterMaps = window.__clusterMaps || {{}};
-                  window.__clusterMaps["{bl}"] = {{{cluster_entries}}};
-                </script>
             </div>
         </div>
         """)
@@ -373,8 +377,7 @@ def main() -> int:
     parser.add_argument("--bin-sizes", required=True)
     parser.add_argument("--downstream-metrics", required=True)
     parser.add_argument("--nucleosome-stats", required=True)
-    parser.add_argument("--saturation-plots", required=True, help="Per-bin Saturation.svg (legacy, unused in template)")
-    parser.add_argument("--saturation-tables", required=True, help="Per-bin _result.txt from atac_saturation.pl")
+    parser.add_argument("--saturation-tables", required=True, help="Per-bin _result.txt from atac_saturation.py")
     parser.add_argument("--fragment-stats-plots", required=True)
     parser.add_argument("--qc-violins", required=True)
     parser.add_argument("--tss-scatters", required=True)
@@ -396,50 +399,67 @@ def main() -> int:
     ])
     qc_metrics = aggregate_global_metrics(qc_rows)
 
-    def parse_per_bin_list(value: str, expected: int) -> list[str]:
+    def parse_per_bin_list(value: str, expected: int, label: str = "") -> list[str]:
         items = [s.strip() for s in value.split(",") if s.strip()]
-        if len(items) != expected:
-            raise ValueError(f"Expected {expected} items, got {len(items)}: {value}")
+        if len(items) < expected:
+            print(
+                f"[WARN] {label}: expected {expected} items, got {len(items)}; padding with empty strings",
+                file=sys.stderr,
+            )
+            items = items + [""] * (expected - len(items))
+        elif len(items) > expected:
+            print(
+                f"[WARN] {label}: expected {expected} items, got {len(items)}; truncating extras",
+                file=sys.stderr,
+            )
+            items = items[:expected]
         return items
 
-    downstream_list = parse_per_bin_list(args.downstream_metrics, num_bins)
-    nucleosome_list = parse_per_bin_list(args.nucleosome_stats, num_bins)
-    saturation_table_list = parse_per_bin_list(args.saturation_tables, num_bins)
-    qc_violins = parse_per_bin_list(args.qc_violins, num_bins)
-    tss_scatters = parse_per_bin_list(args.tss_scatters, num_bins)
-    fragment_sizes = parse_per_bin_list(args.fragment_sizes, num_bins)
-    spatial_qcs = parse_per_bin_list(args.spatial_qcs, num_bins)
-    spatial_qcs_pre = parse_per_bin_list(args.spatial_qcs_pre, num_bins)
+    downstream_list = parse_per_bin_list(args.downstream_metrics, num_bins, "downstream_metrics")
+    nucleosome_list = parse_per_bin_list(args.nucleosome_stats, num_bins, "nucleosome_stats")
+    saturation_table_list = parse_per_bin_list(args.saturation_tables, num_bins, "saturation_tables")
+    qc_violins = parse_per_bin_list(args.qc_violins, num_bins, "qc_violins")
+    tss_scatters = parse_per_bin_list(args.tss_scatters, num_bins, "tss_scatters")
+    fragment_sizes = parse_per_bin_list(args.fragment_sizes, num_bins, "fragment_sizes")
+    spatial_qcs = parse_per_bin_list(args.spatial_qcs, num_bins, "spatial_qcs")
+    spatial_qcs_pre = parse_per_bin_list(args.spatial_qcs_pre, num_bins, "spatial_qcs_pre")
 
     cluster_plots_per_bin = [s.strip() for s in args.cluster_plots_list.split(";")]
-    if len(cluster_plots_per_bin) != num_bins:
-        raise ValueError(f"Expected {num_bins} cluster plot sets, got {len(cluster_plots_per_bin)}")
+    if len(cluster_plots_per_bin) < num_bins:
+        print(
+            f"[WARN] cluster_plots_list: expected {num_bins} sets, got {len(cluster_plots_per_bin)}; padding with empty",
+            file=sys.stderr,
+        )
+        cluster_plots_per_bin = cluster_plots_per_bin + [""] * (num_bins - len(cluster_plots_per_bin))
+    elif len(cluster_plots_per_bin) > num_bins:
+        print(
+            f"[WARN] cluster_plots_list: expected {num_bins} sets, got {len(cluster_plots_per_bin)}; truncating",
+            file=sys.stderr,
+        )
+        cluster_plots_per_bin = cluster_plots_per_bin[:num_bins]
 
     bin_images: dict[str, dict[str, str]] = {}
-    cluster_map: dict[str, dict[str, str]] = {}
+    cluster_map: dict[str, str] = {}
     bin_metrics_map: dict[str, tuple[dict[str, str], dict[str, str]]] = {}
     saturation_per_bin: dict[str, list[dict[str, float]]] = {}
-
-    resolutions = ["0.4", "0.6", "0.8", "1.0", "1.2"]
-    fragment_size_images: dict[str, str] = {}
+    fragment_size_per_bin: dict[str, list[dict[str, float]]] = {}
 
     for i, bl in enumerate(bin_labels):
         bin_images[bl] = {
             "qc": embed_image(qc_violins[i], f"{bl} QC violin"),
             "tss": embed_image(tss_scatters[i], f"{bl} TSS scatter"),
-            "fragment": embed_image(fragment_sizes[i], f"{bl} fragment size"),
             "spatial": embed_image(spatial_qcs[i], f"{bl} spatial QC post-cut"),
             "spatial_pre": embed_image(spatial_qcs_pre[i], f"{bl} spatial QC pre-cut"),
         }
-        fragment_size_images[bl] = bin_images[bl]["fragment"]
+        fragment_size_per_bin[bl] = read_fragment_size_csv(fragment_sizes[i])
 
         cluster_paths = read_cluster_plot_set(cluster_plots_per_bin[i])
-        cluster_map[bl] = {}
-        for j, res in enumerate(resolutions):
-            if j < len(cluster_paths):
-                cluster_map[bl][res] = embed_image(cluster_paths[j], f"{bl} cluster res={res}")
-            else:
-                cluster_map[bl][res] = placeholder_data_uri(f"{bl} cluster res={res}")
+        # Only one cluster resolution (0.8) is generated by signac_analysis.R now.
+        cluster_map[bl] = (
+            embed_image(cluster_paths[0], f"{bl} cluster res=0.8")
+            if cluster_paths
+            else placeholder_data_uri(f"{bl} cluster res=0.8")
+        )
 
         dm = aggregate_bin_metrics(read_metrics([downstream_list[i]]))
         ns = read_nucleosome_stats(nucleosome_list[i])
@@ -449,8 +469,10 @@ def main() -> int:
 
     section1 = render_section1_overview(qc_metrics)
     section2 = render_section2_saturation(saturation_per_bin)
-    section3 = render_section3_fragment(bin_labels, bin_metrics_map, fragment_size_images)
+    section3 = render_section3_fragment(bin_labels, bin_metrics_map)
     section4 = render_section4_downstream(bin_labels, bin_metrics_map, bin_images, cluster_map)
+
+    fragment_data_json = json.dumps(fragment_size_per_bin)
 
     bin_labels_json = json.dumps(bin_labels)
     default_bin = bin_labels[0]
@@ -727,10 +749,11 @@ def main() -> int:
 <script>
     (function() {{
         const satData = window.__saturationData || {{}};
+        const fragmentData = {fragment_data_json};
         const binLabels = {bin_labels_json};
         const defaultBin = "{default_bin}";
 
-        const pal = {{ saturation: "#3182ce", sensitivity: "#38a169" }};
+        const pal = {{ saturation: "#3182ce", sensitivity: "#38a169", fragment: "#1f77b4" }};
 
         let saturationChart, sensitivityChart;
         function renderSaturation(bin) {{
@@ -809,9 +832,70 @@ def main() -> int:
         }}
 
         renderSaturation(defaultBin);
+
+        const fragmentCharts = {{}};  // bin label or "Overview" -> echarts instance
+        function fragmentOption(rows) {{
+            const xAxis = rows.map(r => r.size);
+            const series = rows.map(r => r.percentage);
+            return {{
+                tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'cross' }} }},
+                grid: {{ left: '12%', right: '8%', bottom: '18%', top: '12%' }},
+                xAxis: {{
+                    type: 'category',
+                    name: 'Fragment Size (bp)',
+                    nameLocation: 'middle',
+                    nameGap: 28,
+                    data: xAxis,
+                    axisLine: {{ lineStyle: {{ color: '#666' }} }},
+                    axisLabel: {{ color: '#444', fontSize: 11, interval: 49 }}
+                }},
+                yAxis: {{
+                    type: 'value',
+                    name: 'Percentage (%)',
+                    nameLocation: 'middle',
+                    nameGap: 40,
+                    axisLine: {{ lineStyle: {{ color: '#666' }} }},
+                    splitLine: {{ lineStyle: {{ color: '#e2e8f0', type: 'dashed' }} }}
+                }},
+                series: [{{
+                    name: 'Fragment %',
+                    type: 'line', smooth: true, showSymbol: false,
+                    data: series,
+                    lineStyle: {{ color: pal.fragment, width: 2 }},
+                    itemStyle: {{ color: pal.fragment }},
+                    areaStyle: {{
+                        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                            {{ offset: 0, color: 'rgba(31, 119, 180, 0.30)' }},
+                            {{ offset: 1, color: 'rgba(31, 119, 180, 0.05)' }}
+                        ])
+                    }}
+                }}]
+            }};
+        }}
+        function renderFragmentSize(bin) {{
+            const rows = (fragmentData[bin] || []);
+            // Overview chart (Section 3) — pinned to the primary bin
+            if (bin === defaultBin) {{
+                const el = document.getElementById('fragmentChartOverview');
+                if (el) {{
+                    if (!fragmentCharts['__overview__']) fragmentCharts['__overview__'] = echarts.init(el);
+                    fragmentCharts['__overview__'].setOption(fragmentOption(rows), true);
+                }}
+            }}
+            // Per-bin chart (Section 4 tab)
+            const perBinEl = document.getElementById('fragmentChart_' + bin);
+            if (perBinEl) {{
+                if (!fragmentCharts[bin]) fragmentCharts[bin] = echarts.init(perBinEl);
+                fragmentCharts[bin].setOption(fragmentOption(rows), true);
+            }}
+        }}
+        renderFragmentSize(defaultBin);
+        binLabels.forEach(bl => {{ if (bl !== defaultBin) renderFragmentSize(bl); }});
+
         window.addEventListener('resize', function() {{
             if (saturationChart) saturationChart.resize();
             if (sensitivityChart) sensitivityChart.resize();
+            Object.values(fragmentCharts).forEach(c => c && c.resize());
         }});
 
         const tabButtons = document.querySelectorAll('.tab-btn');
@@ -820,6 +904,7 @@ def main() -> int:
             tabButtons.forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
             tabContents.forEach(c => c.classList.toggle('active', c.id === tabId + '-content'));
             renderSaturation(tabId);
+            renderFragmentSize(tabId);
         }}
         tabButtons.forEach(b => b.addEventListener('click', () => switchBin(b.dataset.tab)));
 
@@ -840,18 +925,13 @@ def main() -> int:
         }});
 
         const clusterMaps = window.__clusterMaps || {{}};
-        const resolutionLabels = ["0.4", "0.6", "0.8", "1.0", "1.2"];
+        const resolutionLabels = ["0.4", "0.6", "0.8", "1.0", "1.2"]; // kept for backwards compat with older HTMLs
         document.querySelectorAll('.res-slider').forEach(slider => {{
-            const bin = slider.dataset.bin;
-            const valEl = document.querySelector(`.res-val[data-bin="${{bin}}"]`);
-            const imgEl = document.querySelector(`.cluster-img[data-bin="${{bin}}"]`);
-            slider.addEventListener('input', function() {{
-                const res = resolutionLabels[Number(this.value)];
-                valEl.textContent = res;
-                const src = (clusterMaps[bin] || {{}})[res];
-                if (src) imgEl.src = src;
-                imgEl.alt = `${{bin}} cluster res=${{res}}`;
-            }});
+            // Legacy slider was retired when signac_analysis.R was simplified to a
+            // single resolution (0.8). The element should no longer be emitted, but
+            // we keep this no-op guard so HTMLs rendered with mismatched assets do
+            // not throw. Just disable the slider visually if it survives somewhere.
+            slider.disabled = true;
         }});
 
         switchBin(defaultBin);
