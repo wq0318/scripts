@@ -344,11 +344,15 @@ tryCatch({
     theme(text=element_text(size=16))
 
     ggsave(file.path(outdir, paste0(sample_name, "_spatial_qc.svg")), p7 + p8, width = 12, height = 6, device = "svg")
+    # Also emit a standalone TSS spatial map for the report's section-4 dropdown
+    # (model0525 template: "bins_under_tissue_TSS.svg" option).
+    ggsave(file.path(outdir, paste0(sample_name, "_bins_under_tissue_TSS.svg")), p8, width = 8, height = 8, device = "svg")
     message("[Signac] Spatial QC plot saved")
 }, error = function(e) {
     message("[Signac] Warning: Spatial QC plot failed: ", e$message)
     blank <- ggplot() + annotate("text", x=0.5, y=0.5, label="Spatial QC failed") + theme_void()
     ggsave(file.path(outdir, paste0(sample_name, "_spatial_qc.svg")), blank, width = 12, height = 6, device = "svg")
+    ggsave(file.path(outdir, paste0(sample_name, "_bins_under_tissue_TSS.svg")), blank, width = 8, height = 8, device = "svg")
 })
 
 tryCatch({

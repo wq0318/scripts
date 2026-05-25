@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
+"""Render the StereoATAC HTML report via Jinja2 (`templates/report.html.j2`).
+
+Replaces the previous f-string-heavy renderer. Parses per-lane QC CSVs +
+per-bin downstream/nucleosome/saturation/fragment outputs, base64-embeds all
+referenced SVG/PNG assets, and hands the assembled context dict to Jinja2.
+"""
 
 from __future__ import annotations
 
 import argparse
 import base64
 import csv
-import html
 import json
 import os
 import sys
@@ -13,35 +18,99 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import quote
 
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+
+# ---------- formatting ----------
 
 def parse_path_list(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
+    return [s.strip() for s in value.split(",") if s.strip()]
 
 
-def read_metrics(paths: list[str]) -> list[dict[str, str]]:
+def to_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def fmt_int(value, fallback: str = "0") -> str:
+    f = to_float(value)
+    return fallback if f is None else f"{int(round(f)):,}"
+
+
+def fmt_pct(value, digits: int = 2, fallback: str = "0.00%") -> str:
+    f = to_float(value)
+    return fallback if f is None else f"{f:.{digits}f}%"
+
+
+def fmt_num(value, digits: int = 2, fallback: str = "0") -> str:
+    f = to_float(value)
+    return fallback if f is None else f"{f:.{digits}f}"
+
+
+# ---------- image embedding ----------
+
+def mime_for(path: str) -> str:
+    suf = Path(path).suffix.lower()
+    if suf == ".svg":
+        return "image/svg+xml"
+    if suf in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suf == ".webp":
+        return "image/webp"
+    return "image/png"
+
+
+def placeholder_uri(title: str) -> str:
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400">'
+        '<rect width="800" height="400" fill="#f7fafc" stroke="#e2e8f0"/>'
+        f'<text x="400" y="200" text-anchor="middle" font-family="Arial" '
+        f'font-size="18" fill="#718096">{title}</text></svg>'
+    )
+    return "data:image/svg+xml;charset=utf-8," + quote(svg)
+
+
+def embed_image(path: str, title: str) -> str:
+    if not path or not os.path.exists(path):
+        return placeholder_uri(title)
+    with open(path, "rb") as fh:
+        return f"data:{mime_for(path)};base64,{base64.b64encode(fh.read()).decode('ascii')}"
+
+
+# ---------- parsers ----------
+
+def read_csv_rows(paths: list[str]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
-    for path in paths:
-        if not path or not os.path.exists(path):
+    for p in paths:
+        if not p or not os.path.exists(p):
             continue
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            rows.extend(csv.DictReader(handle))
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            rows.extend(csv.DictReader(fh))
     return rows
 
 
-def read_cluster_plot_set(value: str) -> list[str]:
-    if value and os.path.exists(value):
-        with open(value, "r", encoding="utf-8", errors="replace") as handle:
-            value = handle.read().strip()
-    return parse_path_list(value)
-
-
-def read_saturation_table(path: str) -> list[dict[str, float]]:
+def read_metric_map(path: str, delimiter: str = ",") -> dict[str, str]:
+    out: dict[str, str] = {}
     if not path or not os.path.exists(path):
-        return []
+        return out
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for row in csv.DictReader(fh, delimiter=delimiter):
+            if "metric" in row and "value" in row:
+                out[row["metric"]] = row["value"]
+    return out
+
+
+def read_saturation(path: str) -> list[dict[str, float]]:
     rows: list[dict[str, float]] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as handle:
-        header = handle.readline()
-        for line in handle:
+    if not path or not os.path.exists(path):
+        return rows
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        fh.readline()  # header
+        for line in fh:
             fields = line.strip().split()
             if len(fields) < 5:
                 continue
@@ -58,892 +127,232 @@ def read_saturation_table(path: str) -> list[dict[str, float]]:
     return rows
 
 
-def read_fragment_size_csv(path: str) -> list[dict[str, float]]:
-    """Read signac_analysis.R's `_fragment_size.csv` and return ECharts-friendly rows."""
-    if not path or not os.path.exists(path):
-        return []
+def read_fragment_size(path: str) -> list[dict[str, float]]:
     rows: list[dict[str, float]] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
+    if not path or not os.path.exists(path):
+        return rows
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for row in csv.DictReader(fh):
             try:
-                size = int(float(row["size"]))
-                percentage = float(row["percentage"])
+                rows.append({
+                    "size": int(float(row["size"])),
+                    "percentage": round(float(row["percentage"]), 4),
+                })
             except (KeyError, TypeError, ValueError):
                 continue
-            rows.append({"size": size, "percentage": round(percentage, 4)})
     return rows
 
 
-def mime_type_for_suffix(path: str) -> str:
-    suffix = Path(path).suffix.lower()
-    if suffix == ".svg":
-        return "image/svg+xml"
-    if suffix in {".jpg", ".jpeg"}:
-        return "image/jpeg"
-    if suffix == ".webp":
-        return "image/webp"
-    return "image/png"
+def read_cluster_first(value: str) -> str:
+    if value and os.path.exists(value):
+        with open(value, encoding="utf-8", errors="replace") as fh:
+            paths = parse_path_list(fh.read())
+            if paths:
+                return paths[0]
+    return ""
 
 
-def placeholder_data_uri(title: str) -> str:
-    safe_title = html.escape(title)
-    svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400">'
-        '<rect width="800" height="400" fill="#f7fafc" stroke="#e2e8f0"/>'
-        f'<text x="400" y="200" text-anchor="middle" font-family="Arial" font-size="18" fill="#718096">{safe_title}</text>'
-        '</svg>'
-    )
-    return "data:image/svg+xml;charset=utf-8," + quote(svg)
+# ---------- aggregators ----------
+
+def build_global_metrics(qc_rows: list[dict[str, str]]) -> dict[str, str]:
+    sums: defaultdict[str, float] = defaultdict(float)
+    latest: dict[str, str] = {}
+    for row in qc_rows:
+        m, v = row.get("metric", ""), row.get("value", "")
+        latest[m] = v
+        f = to_float(v)
+        if f is not None:
+            sums[m] += f
+
+    total_reads = sums.get("total_reads", 0)
+    mapped = sums.get("mapped_reads", 0)
+    exact = sums.get("barcode_exactly_overlap_reads", 0)
+    mis = sums.get("barcode_mis_overlap_reads", 0)
+    chromap_total = sums.get("chromap_total_reads", 0)
+    chromap_hq = sums.get("chromap_high_quality_reads", 0)
+
+    def pct(num: float, den: float) -> str:
+        return f"{(num * 100 / den):.2f}%" if den else "0.00%"
+
+    return {
+        "total_reads": fmt_int(total_reads),
+        "barcode_mapping_rate": pct(mapped, total_reads),
+        "exact_overlap_rate": pct(exact, total_reads),
+        "mismatch_overlap_rate": pct(mis, total_reads),
+        "genome_mapping_rate": pct(chromap_total, mapped),
+        "high_quality_mapping": pct(chromap_hq, chromap_total),
+        "low_quality_mapping": pct(chromap_total - chromap_hq, chromap_total),
+        "sequencing_saturation": fmt_pct(latest.get("saturation", "0")),
+        "mitochondria_ratio": fmt_pct(latest.get("mitochondria_ratio", "0")),
+    }
 
 
-def embed_image(path: str, title: str) -> str:
-    if not path or not os.path.exists(path):
-        return placeholder_data_uri(title)
-    with open(path, "rb") as handle:
-        encoded = base64.b64encode(handle.read()).decode("ascii")
-    return f"data:{mime_type_for_suffix(path)};base64,{encoded}"
+def pad_list(items: list[str], n: int, label: str) -> list[str]:
+    items = list(items)
+    if len(items) < n:
+        print(f"[WARN] {label}: expected {n}, got {len(items)}; padding", file=sys.stderr)
+        items += [""] * (n - len(items))
+    elif len(items) > n:
+        print(f"[WARN] {label}: expected {n}, got {len(items)}; truncating", file=sys.stderr)
+        items = items[:n]
+    return items
 
 
-def to_float(value: str) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def format_int(value: str, fallback: str = "0") -> str:
-    parsed = to_float(value)
-    return fallback if parsed is None else f"{int(round(parsed)):,}"
-
-
-def format_num(value: str, digits: int = 2, suffix: str = "", fallback: str = "0") -> str:
-    parsed = to_float(value)
-    return fallback if parsed is None else f"{parsed:.{digits}f}{suffix}"
-
-
-def aggregate_global_metrics(rows: list[dict[str, str]]) -> dict[str, str]:
-    numeric_sums: defaultdict[str, float] = defaultdict(float)
-    latest_values: dict[str, str] = {}
-
-    for row in rows:
-        metric = row["metric"]
-        value = row["value"]
-        latest_values[metric] = value
-        parsed = to_float(value)
-        if parsed is None:
-            continue
-        numeric_sums[metric] += parsed
-
-    total_reads = numeric_sums.get("total_reads", 0)
-    mapped_reads = numeric_sums.get("mapped_reads", 0)
-    exact_reads = numeric_sums.get("barcode_exactly_overlap_reads", 0)
-    mis_reads = numeric_sums.get("barcode_mis_overlap_reads", 0)
-    mapping_total = numeric_sums.get("chromap_total_reads", 0)
-    mapping_hq = numeric_sums.get("chromap_high_quality_reads", 0)
-
-    latest_values["qc_total_reads"] = str(int(total_reads))
-    latest_values["qc_valid_reads"] = str(int(mapped_reads))
-    latest_values["qc_barcode_mapping_rate"] = f"{(mapped_reads * 100 / total_reads) if total_reads else 0:.2f}"
-    latest_values["qc_exact_overlap_rate"] = f"{(exact_reads * 100 / total_reads) if total_reads else 0:.2f}"
-    latest_values["qc_mismatch_overlap_rate"] = f"{(mis_reads * 100 / total_reads) if total_reads else 0:.2f}"
-    latest_values["qc_mapping_total_reads"] = str(int(mapping_total))
-    latest_values["qc_genome_mapping_rate"] = f"{(mapping_total * 100 / mapped_reads) if mapped_reads else 0:.2f}"
-    latest_values["qc_high_quality_mapping_rate"] = f"{(mapping_hq * 100 / mapping_total) if mapping_total else 0:.2f}"
-    latest_values["qc_low_quality_mapping_rate"] = f"{((mapping_total - mapping_hq) * 100 / mapping_total) if mapping_total else 0:.2f}"
-    latest_values["qc_mitochondria_ratio"] = latest_values.get("mitochondria_ratio", "0")
-    latest_values["qc_saturation"] = latest_values.get("saturation", "0")
-
-    return latest_values
-
-
-def aggregate_bin_metrics(rows: list[dict[str, str]]) -> dict[str, str]:
-    metrics: dict[str, str] = {}
-    for row in rows:
-        metrics[row["metric"]] = row["value"]
-    return metrics
-
-
-def read_nucleosome_stats(path: str) -> dict[str, str]:
-    stats: dict[str, str] = {}
-    if not path or not os.path.exists(path):
-        return stats
-    with open(path, "r", encoding="utf-8", errors="replace") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            if "metric" in row and "value" in row:
-                stats[row["metric"]] = row["value"]
-    return stats
-
-
-def render_section1_overview(qc: dict[str, str]) -> str:
-    total_reads = format_int(qc.get("qc_total_reads", "0"))
-    barcode_rate = format_num(qc.get("qc_barcode_mapping_rate", "0"), suffix="%")
-    exact_rate = format_num(qc.get("qc_exact_overlap_rate", "0"), suffix="%")
-    mismatch_rate = format_num(qc.get("qc_mismatch_overlap_rate", "0"), suffix="%")
-    genome_rate = format_num(qc.get("qc_genome_mapping_rate", "0"), suffix="%")
-    hq_rate = format_num(qc.get("qc_high_quality_mapping_rate", "0"), suffix="%")
-    lq_rate = format_num(qc.get("qc_low_quality_mapping_rate", "0"), suffix="%")
-    saturation_pct = format_num(qc.get("qc_saturation", "0"), suffix="%")
-    mito_rate = format_num(qc.get("qc_mitochondria_ratio", "0"), suffix="%")
-
-    return f"""
-    <h2>1. Alignment &amp; Quality Overview</h2>
-    <div class="qc-overview-container">
-        <div class="qc-table-box">
-            <div class="summary-row">
-                <span class="summary-label">Total Reads</span><span class="summary-val">{total_reads}</span>
-            </div>
-            <details>
-                <summary><span class="summary-label">Barcode Mapping Rate</span><span class="summary-val">{barcode_rate}</span></summary>
-                <div class="nested-content">
-                    <div class="nested-item"><span class="summary-label">Exact Overlap Rate</span><span>{exact_rate}</span></div>
-                    <div class="nested-item"><span class="summary-label">Mismatch Overlap Rate</span><span>{mismatch_rate}</span></div>
-                </div>
-            </details>
-            <details>
-                <summary><span class="summary-label">Genome Mapping Rate</span><span class="summary-val">{genome_rate}</span></summary>
-                <div class="nested-content">
-                    <div class="nested-item"><span class="summary-label">High-quality Mapping Rate</span><span>{hq_rate}</span></div>
-                    <div class="nested-item"><span class="summary-label">Low-quality Mapping Rate</span><span>{lq_rate}</span></div>
-                </div>
-            </details>
-        </div>
-        <div class="qc-table-box">
-            <div class="summary-row">
-                <span class="summary-label">Sequencing Saturation</span><span class="summary-val">{saturation_pct}</span>
-            </div>
-            <div class="summary-row">
-                <span class="summary-label">Mitochondria Ratio</span><span class="summary-val">{mito_rate}</span>
-            </div>
-        </div>
-    </div>
-    """
-
-
-def render_section2_saturation(saturation_per_bin: dict[str, list[dict[str, float]]]) -> str:
-    js_payload = {}
-    for bin_label, rows in saturation_per_bin.items():
-        js_payload[bin_label] = [
-            {
-                "total_m": round(row["total"] / 1_000_000.0, 3),
-                "dup_pct": round(row["dup_pct"], 2),
-                "median_nfrags": round(row["median_nfrags"], 1),
-            }
-            for row in rows
-        ]
-    data_json = json.dumps(js_payload)
-
-    return f"""
-    <h2>2. Sequencing Saturation</h2>
-    <div class="chart-grid">
-        <div class="chart-card">
-            <span class="chart-title">Sequencing Saturation Plot</span>
-            <div id="saturationChart" class="chart-container"></div>
-        </div>
-        <div class="chart-card">
-            <span class="chart-title">Library Sensitivity Plot</span>
-            <div id="sensitivityChart" class="chart-container"></div>
-        </div>
-    </div>
-    <script>
-      window.__saturationData = {data_json};
-    </script>
-    """
-
-
-def render_section3_fragment(bin_labels: list[str], bin_metrics_map: dict[str, tuple[dict[str, str], dict[str, str]]]) -> str:
-    primary = bin_labels[0]
-    _, ns = bin_metrics_map[primary]
-    nfr = format_num(ns.get("fraction_nfr", "0"), suffix="%")
-    mono = format_num(ns.get("fraction_mono_nucleosome", "0"), suffix="%")
-    multi = format_num(ns.get("fraction_multi_nucleosome", "0"), suffix="%")
-
-    return f"""
-    <h2>3. Fragment Size Distribution <span class="bin-context">({primary})</span></h2>
-    <div class="qc-overview-container">
-        <div style="flex: 0 0 350px;">
-            <span class="chart-title" style="text-align: left;">Fragment Statistics</span>
-            <table class="metrics-table">
-                <tr><td align="left">Fraction of NFR</td><td>{nfr}</td></tr>
-                <tr><td align="left">Fraction of Mono-nucleosome</td><td>{mono}</td></tr>
-                <tr><td align="left">Fraction of Multi-nucleosome</td><td>{multi}</td></tr>
-            </table>
-        </div>
-        <div class="chart-card" style="flex: 1;">
-            <span class="chart-title">Insert Size Distribution</span>
-            <div id="fragmentChartOverview" class="chart-container"></div>
-        </div>
-    </div>
-    """
-
-
-def render_section4_downstream(bin_labels: list[str],
-                                bin_metrics_map: dict[str, tuple[dict[str, str], dict[str, str]]],
-                                bin_images: dict[str, dict[str, str]],
-                                cluster_map: dict[str, str]) -> str:
-    header = "".join([
-        "<th>Resolution</th>",
-        "<th>Total spots</th>",
-        "<th>Valid spots</th>",
-        "<th>Median nFrags</th>",
-        "<th>Median TSS</th>",
-        "<th>Median FRiP</th>",
-    ])
-    body_rows = []
-    for bl in bin_labels:
-        dm, ns = bin_metrics_map[bl]
-        body_rows.append(
-            "<tr>"
-            f"<td><strong>Bin {bl.replace('bin', '')}</strong></td>"
-            f"<td>{format_int(dm.get('total_barcodes', '0'))}</td>"
-            f"<td>{format_int(dm.get('valid_barcodes', '0'))}</td>"
-            f"<td>{format_int(dm.get('median_nFrags', '0'))}</td>"
-            f"<td>{format_num(dm.get('median_TSS', '0'), digits=2)}</td>"
-            f"<td>{format_num(dm.get('median_FRiP', '0'), digits=2)}</td>"
-            "</tr>"
-        )
-    table_html = (
-        '<table class="metrics-table">'
-        f'<thead><tr>{header}</tr></thead>'
-        f'<tbody>{"".join(body_rows)}</tbody>'
-        '</table>'
+def resolve_template_dir(explicit: str) -> Path:
+    """Locate templates/report.html.j2: --template-dir wins, then alongside
+    the script, then sibling to the scripts/ folder. The fallback chain lets
+    the same renderer work locally and inside docker without recompiling the
+    image when the layout differs."""
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    here = Path(__file__).resolve().parent
+    candidates.append(here / "templates")
+    candidates.append(here.parent / "templates")
+    for c in candidates:
+        if (c / "report.html.j2").exists():
+            return c
+    raise FileNotFoundError(
+        f"report.html.j2 not found in any of: {[str(c) for c in candidates]}"
     )
 
-    tab_btns = "".join(
-        f'<button class="tab-btn{" active" if i == 0 else ""}" data-tab="{bl}">{bl.replace("bin", "Bin ")} View</button>'
-        for i, bl in enumerate(bin_labels)
-    )
 
-    tab_contents = []
-    for i, bl in enumerate(bin_labels):
-        active_cls = " active" if i == 0 else ""
-        images = bin_images[bl]
-        tab_contents.append(f"""
-        <div class="tab-content{active_cls}" id="{bl}-content">
-            <div class="bin-toolbar">
-                <button class="layout-btn active" data-layout="post" data-bin="{bl}">Post-cut View</button>
-                <button class="layout-btn" data-layout="pre" data-bin="{bl}">Pre-cut View</button>
-            </div>
+# ---------- main ----------
 
-            <div class="chart-grid layout-stage" data-bin="{bl}">
-                <div class="chart-card">
-                    <span class="chart-title">Spatial nFrags</span>
-                    <img class="full-img stage-img" data-img-post="{images['spatial']}" data-img-pre="{images['spatial_pre']}" src="{images['spatial']}" alt="{bl} spatial nFrags" />
-                </div>
-                <div class="chart-card">
-                    <span class="chart-title">TSS Enrichment Scatter</span>
-                    <img class="full-img" src="{images['tss']}" alt="{bl} TSS scatter" />
-                </div>
-            </div>
-
-            <div class="chart-grid" style="margin-top: 20px;">
-                <div class="chart-card"><span class="chart-title">QC Violin Plots</span><img class="full-img" src="{images['qc']}" alt="{bl} qc violin" /></div>
-                <div class="chart-card"><span class="chart-title">Fragment Size</span><div id="fragmentChart_{bl}" class="chart-container"></div></div>
-            </div>
-
-            <div class="cluster-control-panel">
-                <div class="chart-card cluster-canvas">
-                    <span class="chart-title">UMAP + Spatial Clusters (res=0.8)</span>
-                    <img class="full-img" src="{cluster_map[bl]}" alt="{bl} cluster res=0.8" />
-                </div>
-            </div>
-        </div>
-        """)
-
-    return f"""
-    <h2>4. Downstream Analysis Metrics</h2>
-    {table_html}
-
-    <div class="interactive-container">
-        <div class="tab-buttons">
-            {tab_btns}
-        </div>
-        {"".join(tab_contents)}
-    </div>
-    """
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Render StereoATAC final HTML report via Jinja2.")
+    p.add_argument("sample_name")
+    p.add_argument("output_html")
+    p.add_argument("barcode_metrics")
+    p.add_argument("mapping_metrics")
+    p.add_argument("sam2frag_metrics")
+    p.add_argument("merge_metrics")
+    p.add_argument("--bin-sizes", required=True)
+    p.add_argument("--downstream-metrics", required=True)
+    p.add_argument("--nucleosome-stats", required=True)
+    p.add_argument("--saturation-tables", required=True)
+    p.add_argument("--fragment-stats-plots", default="",
+                   help="Accepted for WDL compat; not consumed by the Jinja2 renderer")
+    p.add_argument("--qc-violins", required=True)
+    p.add_argument("--tss-scatters", required=True)
+    p.add_argument("--fragment-sizes", required=True)
+    p.add_argument("--spatial-qcs", default="",
+                   help="Accepted for WDL compat; superseded by --spatial-tiles-bin100")
+    p.add_argument("--spatial-qcs-pre", default="",
+                   help="Accepted for WDL compat; superseded by --spatial-tiles-bin100")
+    p.add_argument("--cluster-plots-list", required=True)
+    p.add_argument("--spatial-tiles-bin100", default="",
+                   help="Comma-separated 5 SVGs from plot_spatial_tiles.R "
+                        "(order: filtered, raw, chrM, blacklist, tissue_filtered)")
+    p.add_argument("--spatial-tss-bin100", default="",
+                   help="bin100 _bins_under_tissue_TSS.svg from signac_analysis.R")
+    p.add_argument("--template-dir", default="",
+                   help="Override path to dir containing report.html.j2")
+    return p.parse_args()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Render multi-bin StereoATAC HTML report aligned with preview.html template"
-    )
-    parser.add_argument("sample_name")
-    parser.add_argument("output_html")
-    parser.add_argument("barcode_metrics", help="Comma-separated barcode mapping metrics CSV files")
-    parser.add_argument("mapping_metrics", help="Comma-separated mapping metrics CSV files")
-    parser.add_argument("sam2frag_metrics", help="Comma-separated sam2frag metrics CSV files")
-    parser.add_argument("merge_metrics", help="Merge metrics CSV file")
-    parser.add_argument("--bin-sizes", required=True)
-    parser.add_argument("--downstream-metrics", required=True)
-    parser.add_argument("--nucleosome-stats", required=True)
-    parser.add_argument("--saturation-tables", required=True, help="Per-bin _result.txt from atac_saturation.py")
-    parser.add_argument("--fragment-stats-plots", required=True)
-    parser.add_argument("--qc-violins", required=True)
-    parser.add_argument("--tss-scatters", required=True)
-    parser.add_argument("--fragment-sizes", required=True)
-    parser.add_argument("--spatial-qcs", required=True, help="Per-bin post-cut spatial_qc.svg")
-    parser.add_argument("--spatial-qcs-pre", required=True, help="Per-bin pre-cut spatial_qc_pre.svg")
-    parser.add_argument("--cluster-plots-list", required=True)
-    args = parser.parse_args()
-
+    args = parse_args()
     bin_sizes = [s.strip() for s in args.bin_sizes.split(",") if s.strip()]
-    bin_labels = [f"bin{s}" for s in bin_sizes]
-    num_bins = len(bin_labels)
+    n = len(bin_sizes)
 
-    qc_rows = read_metrics([
+    qc_rows = read_csv_rows([
         *parse_path_list(args.barcode_metrics),
         *parse_path_list(args.mapping_metrics),
         *parse_path_list(args.sam2frag_metrics),
         args.merge_metrics,
     ])
-    qc_metrics = aggregate_global_metrics(qc_rows)
+    metrics = build_global_metrics(qc_rows)
 
-    def parse_per_bin_list(value: str, expected: int, label: str = "") -> list[str]:
-        items = [s.strip() for s in value.split(",") if s.strip()]
-        if len(items) < expected:
-            print(
-                f"[WARN] {label}: expected {expected} items, got {len(items)}; padding with empty strings",
-                file=sys.stderr,
-            )
-            items = items + [""] * (expected - len(items))
-        elif len(items) > expected:
-            print(
-                f"[WARN] {label}: expected {expected} items, got {len(items)}; truncating extras",
-                file=sys.stderr,
-            )
-            items = items[:expected]
-        return items
+    downstream_list = pad_list(parse_path_list(args.downstream_metrics), n, "downstream-metrics")
+    nucleosome_list = pad_list(parse_path_list(args.nucleosome_stats), n, "nucleosome-stats")
+    saturation_list = pad_list(parse_path_list(args.saturation_tables), n, "saturation-tables")
+    qc_violins = pad_list(parse_path_list(args.qc_violins), n, "qc-violins")
+    tss_scatters = pad_list(parse_path_list(args.tss_scatters), n, "tss-scatters")
+    fragment_sizes = pad_list(parse_path_list(args.fragment_sizes), n, "fragment-sizes")
+    cluster_lists = pad_list(
+        [s.strip() for s in args.cluster_plots_list.split(";")], n, "cluster-plots-list"
+    )
 
-    downstream_list = parse_per_bin_list(args.downstream_metrics, num_bins, "downstream_metrics")
-    nucleosome_list = parse_per_bin_list(args.nucleosome_stats, num_bins, "nucleosome_stats")
-    saturation_table_list = parse_per_bin_list(args.saturation_tables, num_bins, "saturation_tables")
-    qc_violins = parse_per_bin_list(args.qc_violins, num_bins, "qc_violins")
-    tss_scatters = parse_per_bin_list(args.tss_scatters, num_bins, "tss_scatters")
-    fragment_sizes = parse_per_bin_list(args.fragment_sizes, num_bins, "fragment_sizes")
-    spatial_qcs = parse_per_bin_list(args.spatial_qcs, num_bins, "spatial_qcs")
-    spatial_qcs_pre = parse_per_bin_list(args.spatial_qcs_pre, num_bins, "spatial_qcs_pre")
+    bins_ctx: list[dict] = []
+    primary_ns: dict[str, str] = {}
+    primary_blacklist = "0"
+    saturation_payload = {"duplicate_rate": [], "median_nfrags": []}
 
-    cluster_plots_per_bin = [s.strip() for s in args.cluster_plots_list.split(";")]
-    if len(cluster_plots_per_bin) < num_bins:
-        print(
-            f"[WARN] cluster_plots_list: expected {num_bins} sets, got {len(cluster_plots_per_bin)}; padding with empty",
-            file=sys.stderr,
-        )
-        cluster_plots_per_bin = cluster_plots_per_bin + [""] * (num_bins - len(cluster_plots_per_bin))
-    elif len(cluster_plots_per_bin) > num_bins:
-        print(
-            f"[WARN] cluster_plots_list: expected {num_bins} sets, got {len(cluster_plots_per_bin)}; truncating",
-            file=sys.stderr,
-        )
-        cluster_plots_per_bin = cluster_plots_per_bin[:num_bins]
+    for i, b in enumerate(bin_sizes):
+        ds = read_metric_map(downstream_list[i], delimiter=",")
+        ns = read_metric_map(nucleosome_list[i], delimiter="\t")
+        if i == 0:
+            primary_ns = ns
+            primary_blacklist = ds.get("median_blacklist", "0")
 
-    bin_images: dict[str, dict[str, str]] = {}
-    cluster_map: dict[str, str] = {}
-    bin_metrics_map: dict[str, tuple[dict[str, str], dict[str, str]]] = {}
-    saturation_per_bin: dict[str, list[dict[str, float]]] = {}
-    fragment_size_per_bin: dict[str, list[dict[str, float]]] = {}
+        sat_rows = read_saturation(saturation_list[i])
+        saturation_payload["duplicate_rate"].append({
+            "bin": b,
+            "points": [[round(r["total"] / 1_000_000.0, 3), round(r["dup_pct"], 2)] for r in sat_rows],
+        })
+        saturation_payload["median_nfrags"].append({
+            "bin": b,
+            "points": [[round(r["total"] / 1_000_000.0, 3), round(r["median_nfrags"], 1)] for r in sat_rows],
+        })
 
-    for i, bl in enumerate(bin_labels):
-        bin_images[bl] = {
-            "qc": embed_image(qc_violins[i], f"{bl} QC violin"),
-            "tss": embed_image(tss_scatters[i], f"{bl} TSS scatter"),
-            "spatial": embed_image(spatial_qcs[i], f"{bl} spatial QC post-cut"),
-            "spatial_pre": embed_image(spatial_qcs_pre[i], f"{bl} spatial QC pre-cut"),
-        }
-        fragment_size_per_bin[bl] = read_fragment_size_csv(fragment_sizes[i])
+        bins_ctx.append({
+            "size": b,
+            "total_spots": fmt_int(ds.get("total_barcodes", "0")),
+            "valid_spots": fmt_int(ds.get("valid_barcodes", "0")),
+            "median_nFrags": fmt_int(ds.get("median_nFrags", "0")),
+            "median_TSS": fmt_num(ds.get("median_TSS", "0")),
+            "median_FRiP": fmt_num(ds.get("median_FRiP", "0")),
+            "qc_violin": embed_image(qc_violins[i], f"bin{b} QC violin"),
+            "tss_scatter": embed_image(tss_scatters[i], f"bin{b} TSS scatter"),
+            "cluster": embed_image(read_cluster_first(cluster_lists[i]),
+                                   f"bin{b} cluster res=0.8"),
+        })
 
-        cluster_paths = read_cluster_plot_set(cluster_plots_per_bin[i])
-        # Only one cluster resolution (0.8) is generated by signac_analysis.R now.
-        cluster_map[bl] = (
-            embed_image(cluster_paths[0], f"{bl} cluster res=0.8")
-            if cluster_paths
-            else placeholder_data_uri(f"{bl} cluster res=0.8")
-        )
+    metrics["blacklist_ratio"] = fmt_pct(primary_blacklist)
+    metrics["fraction_nfr"] = fmt_pct(primary_ns.get("fraction_nfr", "0"))
+    metrics["fraction_mono"] = fmt_pct(primary_ns.get("fraction_mono_nucleosome", "0"))
+    metrics["fraction_multi"] = fmt_pct(primary_ns.get("fraction_multi_nucleosome", "0"))
 
-        dm = aggregate_bin_metrics(read_metrics([downstream_list[i]]))
-        ns = read_nucleosome_stats(nucleosome_list[i])
-        bin_metrics_map[bl] = (dm, ns)
+    tile_paths = pad_list(parse_path_list(args.spatial_tiles_bin100), 5, "spatial-tiles-bin100")
+    # Order MUST match plot_spatial_tiles.R output:
+    #   _all_bins_nFrags_filtered, _all_bins_nFrags_raw, _all_bins_nFrags_chrM,
+    #   _all_bins_nFrags_blacklist, _bins_under_tissue_nFrags_filtered
+    tile_keys = ["all_filtered", "all_raw", "all_chrm", "all_blacklist", "tissue_filtered"]
+    tile_titles = {
+        "all_filtered": "All bins - nFrags_filtered",
+        "all_raw": "All bins - nFrags_raw",
+        "all_chrm": "All bins - nFrags_chrM",
+        "all_blacklist": "All bins - nFrags_blacklist",
+        "tissue_filtered": "Bins under tissue - nFrags_filtered",
+    }
+    tiles_ctx = {k: embed_image(p, tile_titles[k]) for k, p in zip(tile_keys, tile_paths)}
+    tiles_ctx["tissue_tss"] = embed_image(args.spatial_tss_bin100, "Bins under tissue - TSS")
 
-        saturation_per_bin[bl] = read_saturation_table(saturation_table_list[i])
+    primary_fragment = read_fragment_size(fragment_sizes[0]) if fragment_sizes else []
 
-    section1 = render_section1_overview(qc_metrics)
-    section2 = render_section2_saturation(saturation_per_bin)
-    section3 = render_section3_fragment(bin_labels, bin_metrics_map)
-    section4 = render_section4_downstream(bin_labels, bin_metrics_map, bin_images, cluster_map)
+    context = {
+        "sample_name": args.sample_name,
+        "bins_label": ", ".join(f"bin{b}" for b in bin_sizes),
+        "metrics": metrics,
+        "tiles": tiles_ctx,
+        "bins": bins_ctx,
+        "saturation_data_json": json.dumps(saturation_payload),
+        "fragment_data_json": json.dumps(primary_fragment),
+    }
 
-    fragment_data_json = json.dumps(fragment_size_per_bin)
+    template_dir = resolve_template_dir(args.template_dir)
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        autoescape=select_autoescape(["html", "xml"]),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    rendered = env.get_template("report.html.j2").render(**context)
 
-    bin_labels_json = json.dumps(bin_labels)
-    default_bin = bin_labels[0]
-    title = f"{args.sample_name} StereoATAC-seq Quality Control Report"
-
-    html_text = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{html.escape(title)}</title>
-    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
-    <style>
-        :root {{
-            --primary-color: #1a365d;
-            --secondary-color: #2d3748;
-            --accent-color: #3182ce;
-            --bg-color: #f7fafc;
-            --border-color: #e2e8f0;
-            --highlight-bg: #edf2f7;
-            --card-bg: #ffffff;
-            --text-primary: #1a202c;
-            --text-secondary: #4a5568;
-            --text-muted: #718096;
-        }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-            font-size: 20px;
-            color: var(--text-primary);
-            background-color: var(--bg-color);
-            line-height: 1.6;
-            margin: 0;
-            padding: 30px 20px;
-        }}
-        .container {{
-            max-width: 1000px;
-            margin: 0 auto;
-            background: var(--card-bg);
-            padding: 35px 40px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 4px 16px rgba(0,0,0,0.04);
-            border: 1px solid var(--border-color);
-        }}
-        .main-title {{
-            font-size: 26px;
-            font-weight: 600;
-            margin-bottom: 8px;
-            color: var(--primary-color);
-            letter-spacing: 0.5px;
-        }}
-        .sub-title {{
-            font-size: 17px;
-            color: var(--text-muted);
-            margin-bottom: 30px;
-            border-bottom: 2px solid var(--border-color);
-            padding-bottom: 15px;
-        }}
-        h2 {{
-            font-size: 23px;
-            font-weight: 600;
-            color: var(--primary-color);
-            border-left: 4px solid var(--accent-color);
-            padding-left: 14px;
-            margin-top: 40px;
-            margin-bottom: 18px;
-            background: linear-gradient(to right, var(--highlight-bg), transparent);
-            padding-top: 8px;
-            padding-bottom: 8px;
-        }}
-        .bin-context {{
-            font-size: 14px;
-            color: var(--text-muted);
-            font-weight: 400;
-        }}
-        .qc-overview-container {{
-            display: flex;
-            gap: 40px;
-            align-items: flex-start;
-        }}
-        .qc-table-box {{ flex: 1; }}
-        .summary-row {{
-            padding: 10px 0;
-            font-size: 17px;
-            display: flex;
-            justify-content: space-between;
-            border-bottom: 1px solid #f0f0f0;
-        }}
-        details {{
-            margin-bottom: 0;
-            cursor: pointer;
-            border-bottom: 1px solid var(--border-color);
-            background: white;
-        }}
-        details:hover {{ background: var(--highlight-bg); }}
-        summary {{
-            padding: 12px 0;
-            font-size: 17px;
-            list-style: none;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            color: var(--text-secondary);
-            font-weight: 500;
-        }}
-        summary::-webkit-details-marker {{ display: none; }}
-        summary::before {{
-            content: "▶";
-            font-size: 10px;
-            margin-right: 10px;
-            transition: transform 0.2s;
-            color: var(--text-muted);
-        }}
-        details[open] summary::before {{ transform: rotate(90deg); }}
-        .summary-label {{ flex: 1; }}
-        .summary-val {{
-            font-weight: 600;
-            color: var(--accent-color);
-            font-family: "Arial", "Helvetica", sans-serif;
-        }}
-        .nested-content {{
-            padding-left: 30px;
-            padding-bottom: 12px;
-            font-size: 16px;
-            color: var(--text-secondary);
-            background: var(--highlight-bg);
-        }}
-        .nested-item {{
-            display: flex;
-            justify-content: space-between;
-            padding: 5px 0;
-        }}
-        .chart-grid {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 25px;
-            margin-top: 20px;
-        }}
-        .chart-card {{
-            border: 1px solid var(--border-color);
-            padding: 20px;
-            background: var(--card-bg);
-            border-radius: 4px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-        }}
-        .chart-title {{
-            font-size: 17px;
-            font-weight: 600;
-            margin-bottom: 15px;
-            display: block;
-            text-align: center;
-            color: var(--text-secondary);
-        }}
-        .chart-container {{
-            width: 100%;
-            height: 250px;
-        }}
-        .full-img {{
-            display: block;
-            width: 100%;
-            height: auto;
-        }}
-        .metrics-table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 15px;
-            font-size: 16px;
-        }}
-        .metrics-table th, .metrics-table td {{
-            border: 1px solid var(--border-color);
-            padding: 10px 12px;
-            text-align: center;
-        }}
-        .metrics-table th {{
-            background: var(--highlight-bg);
-            font-weight: 600;
-            color: var(--text-primary);
-        }}
-        .metrics-table tr:hover {{ background: var(--highlight-bg); }}
-        .interactive-container {{
-            border: 1px solid var(--border-color);
-            margin-top: 25px;
-            padding: 25px;
-            border-radius: 6px;
-            background: var(--card-bg);
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-        }}
-        .tab-buttons {{
-            display: flex;
-            gap: 12px;
-            margin-bottom: 25px;
-            border-bottom: 2px solid var(--border-color);
-            padding-bottom: 12px;
-        }}
-        .tab-btn, .layout-btn {{
-            padding: 8px 24px;
-            border: 1px solid var(--border-color);
-            background: white;
-            cursor: pointer;
-            transition: all 0.2s;
-            font-size: 16px;
-            font-weight: 500;
-            color: var(--text-secondary);
-            border-radius: 3px;
-        }}
-        .tab-btn:hover, .layout-btn:hover {{
-            background: var(--highlight-bg);
-            border-color: var(--accent-color);
-        }}
-        .tab-btn.active, .layout-btn.active {{
-            background: var(--accent-color);
-            color: white;
-            border-color: var(--accent-color);
-        }}
-        .tab-content {{ display: none; }}
-        .tab-content.active {{ display: block; }}
-        .bin-toolbar {{
-            display: flex;
-            gap: 8px;
-            margin-bottom: 20px;
-        }}
-        .cluster-control-panel {{
-            margin-top: 30px;
-            background: var(--highlight-bg);
-            padding: 20px;
-            border-radius: 6px;
-            border: 1px solid var(--border-color);
-        }}
-        .slider-box {{
-            display: flex;
-            align-items: center;
-            gap: 20px;
-            background: white;
-            padding: 12px 25px;
-            margin: 0 0 15px 0;
-            border-radius: 4px;
-            font-size: 17px;
-            border: 1px solid var(--border-color);
-        }}
-        .slider-box input[type="range"] {{
-            flex: 0 0 200px;
-            accent-color: var(--accent-color);
-        }}
-        .res-val {{
-            font-family: monospace;
-            font-weight: bold;
-            color: var(--accent-color);
-            min-width: 30px;
-        }}
-        .cluster-canvas {{
-            margin-top: 12px;
-        }}
-        footer {{
-            margin-top: 50px;
-            text-align: center;
-            color: var(--text-muted);
-            font-size: 15px;
-            padding-top: 20px;
-            border-top: 1px solid var(--border-color);
-        }}
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="main-title">{html.escape(title)}</div>
-    <div class="sub-title">Sample: {html.escape(args.sample_name)} &nbsp;|&nbsp; Bins: {", ".join(bin_labels)}</div>
-
-    {section1}
-    {section2}
-    {section3}
-    {section4}
-
-    <footer>StereoATAC-seq Pipeline | Standardized QC Report</footer>
-</div>
-
-<script>
-    (function() {{
-        const satData = window.__saturationData || {{}};
-        const fragmentData = {fragment_data_json};
-        const binLabels = {bin_labels_json};
-        const defaultBin = "{default_bin}";
-
-        const pal = {{ saturation: "#3182ce", sensitivity: "#38a169", fragment: "#1f77b4" }};
-
-        let saturationChart, sensitivityChart;
-        function renderSaturation(bin) {{
-            const rows = satData[bin] || [];
-            const xAxis = rows.map(r => r.total_m);
-            const dup = rows.map(r => r.dup_pct);
-            const median = rows.map(r => r.median_nfrags);
-
-            const baseGrid = {{ left: '12%', right: '8%', bottom: '18%', top: '12%' }};
-            const xAxisCommon = {{
-                type: 'category',
-                name: 'Total Fragments (M)',
-                nameLocation: 'middle',
-                nameGap: 28,
-                data: xAxis,
-                axisLine: {{ lineStyle: {{ color: '#666' }} }},
-                axisLabel: {{ color: '#444', fontSize: 11 }}
-            }};
-
-            if (!saturationChart) saturationChart = echarts.init(document.getElementById('saturationChart'));
-            saturationChart.setOption({{
-                tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'cross' }} }},
-                grid: baseGrid,
-                xAxis: xAxisCommon,
-                yAxis: {{
-                    type: 'value',
-                    name: 'Duplicate Rate (%)',
-                    nameLocation: 'middle',
-                    nameGap: 40,
-                    axisLine: {{ lineStyle: {{ color: '#666' }} }},
-                    axisLabel: {{ formatter: '{{value}}%' }},
-                    splitLine: {{ lineStyle: {{ color: '#e2e8f0', type: 'dashed' }} }}
-                }},
-                series: [{{
-                    name: 'Duplicate %',
-                    type: 'line', smooth: true, symbol: 'circle', symbolSize: 6,
-                    data: dup,
-                    lineStyle: {{ color: pal.saturation, width: 2.5 }},
-                    itemStyle: {{ color: pal.saturation }},
-                    areaStyle: {{
-                        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                            {{ offset: 0, color: 'rgba(49, 130, 206, 0.3)' }},
-                            {{ offset: 1, color: 'rgba(49, 130, 206, 0.05)' }}
-                        ])
-                    }}
-                }}]
-            }}, true);
-
-            if (!sensitivityChart) sensitivityChart = echarts.init(document.getElementById('sensitivityChart'));
-            sensitivityChart.setOption({{
-                tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'cross' }} }},
-                grid: baseGrid,
-                xAxis: xAxisCommon,
-                yAxis: {{
-                    type: 'value',
-                    name: 'Median nFrags / Bin',
-                    nameLocation: 'middle',
-                    nameGap: 48,
-                    axisLine: {{ lineStyle: {{ color: '#666' }} }},
-                    splitLine: {{ lineStyle: {{ color: '#e2e8f0', type: 'dashed' }} }}
-                }},
-                series: [{{
-                    name: 'Median nFrags',
-                    type: 'line', smooth: true, symbol: 'circle', symbolSize: 6,
-                    data: median,
-                    lineStyle: {{ color: pal.sensitivity, width: 2.5 }},
-                    itemStyle: {{ color: pal.sensitivity }},
-                    areaStyle: {{
-                        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                            {{ offset: 0, color: 'rgba(56, 161, 105, 0.3)' }},
-                            {{ offset: 1, color: 'rgba(56, 161, 105, 0.05)' }}
-                        ])
-                    }}
-                }}]
-            }}, true);
-        }}
-
-        renderSaturation(defaultBin);
-
-        const fragmentCharts = {{}};  // bin label or "Overview" -> echarts instance
-        function fragmentOption(rows) {{
-            const xAxis = rows.map(r => r.size);
-            const series = rows.map(r => r.percentage);
-            return {{
-                tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'cross' }} }},
-                grid: {{ left: '12%', right: '8%', bottom: '18%', top: '12%' }},
-                xAxis: {{
-                    type: 'category',
-                    name: 'Fragment Size (bp)',
-                    nameLocation: 'middle',
-                    nameGap: 28,
-                    data: xAxis,
-                    axisLine: {{ lineStyle: {{ color: '#666' }} }},
-                    axisLabel: {{ color: '#444', fontSize: 11, interval: 49 }}
-                }},
-                yAxis: {{
-                    type: 'value',
-                    name: 'Percentage (%)',
-                    nameLocation: 'middle',
-                    nameGap: 40,
-                    axisLine: {{ lineStyle: {{ color: '#666' }} }},
-                    splitLine: {{ lineStyle: {{ color: '#e2e8f0', type: 'dashed' }} }}
-                }},
-                series: [{{
-                    name: 'Fragment %',
-                    type: 'line', smooth: true, showSymbol: false,
-                    data: series,
-                    lineStyle: {{ color: pal.fragment, width: 2 }},
-                    itemStyle: {{ color: pal.fragment }},
-                    areaStyle: {{
-                        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                            {{ offset: 0, color: 'rgba(31, 119, 180, 0.30)' }},
-                            {{ offset: 1, color: 'rgba(31, 119, 180, 0.05)' }}
-                        ])
-                    }}
-                }}]
-            }};
-        }}
-        function renderFragmentSize(bin) {{
-            const rows = (fragmentData[bin] || []);
-            // Overview chart (Section 3) — pinned to the primary bin
-            if (bin === defaultBin) {{
-                const el = document.getElementById('fragmentChartOverview');
-                if (el) {{
-                    if (!fragmentCharts['__overview__']) fragmentCharts['__overview__'] = echarts.init(el);
-                    fragmentCharts['__overview__'].setOption(fragmentOption(rows), true);
-                }}
-            }}
-            // Per-bin chart (Section 4 tab)
-            const perBinEl = document.getElementById('fragmentChart_' + bin);
-            if (perBinEl) {{
-                if (!fragmentCharts[bin]) fragmentCharts[bin] = echarts.init(perBinEl);
-                fragmentCharts[bin].setOption(fragmentOption(rows), true);
-            }}
-        }}
-        renderFragmentSize(defaultBin);
-        binLabels.forEach(bl => {{ if (bl !== defaultBin) renderFragmentSize(bl); }});
-
-        window.addEventListener('resize', function() {{
-            if (saturationChart) saturationChart.resize();
-            if (sensitivityChart) sensitivityChart.resize();
-            Object.values(fragmentCharts).forEach(c => c && c.resize());
-        }});
-
-        const tabButtons = document.querySelectorAll('.tab-btn');
-        const tabContents = document.querySelectorAll('.tab-content');
-        function switchBin(tabId) {{
-            tabButtons.forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
-            tabContents.forEach(c => c.classList.toggle('active', c.id === tabId + '-content'));
-            renderSaturation(tabId);
-            renderFragmentSize(tabId);
-        }}
-        tabButtons.forEach(b => b.addEventListener('click', () => switchBin(b.dataset.tab)));
-
-        document.querySelectorAll('.layout-btn').forEach(btn => {{
-            btn.addEventListener('click', function() {{
-                const bin = this.dataset.bin;
-                const layout = this.dataset.layout;
-                document.querySelectorAll(`.layout-btn[data-bin="${{bin}}"]`).forEach(b =>
-                    b.classList.toggle('active', b === this));
-                document.querySelectorAll(`.stage-img`).forEach(img => {{
-                    const parentBin = img.closest('.tab-content').id.replace('-content', '');
-                    if (parentBin !== bin) return;
-                    const src = layout === 'pre' ? img.dataset.imgPre : img.dataset.imgPost;
-                    if (src) img.src = src;
-                    img.alt = `${{bin}} spatial nFrags (${{layout}}-cut)`;
-                }});
-            }});
-        }});
-
-        const clusterMaps = window.__clusterMaps || {{}};
-        const resolutionLabels = ["0.4", "0.6", "0.8", "1.0", "1.2"]; // kept for backwards compat with older HTMLs
-        document.querySelectorAll('.res-slider').forEach(slider => {{
-            // Legacy slider was retired when signac_analysis.R was simplified to a
-            // single resolution (0.8). The element should no longer be emitted, but
-            // we keep this no-op guard so HTMLs rendered with mismatched assets do
-            // not throw. Just disable the slider visually if it survives somewhere.
-            slider.disabled = true;
-        }});
-
-        switchBin(defaultBin);
-    }})();
-</script>
-</body>
-</html>
-"""
-
-    Path(args.output_html).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output_html, "w", encoding="utf-8") as handle:
-        handle.write(html_text)
+    out_path = Path(args.output_html)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(rendered, encoding="utf-8")
     return 0
 
 
