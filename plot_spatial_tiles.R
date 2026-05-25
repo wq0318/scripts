@@ -55,15 +55,14 @@ plot_tile <- function(data, value_col, title, outfile) {
             theme_void() +
             theme(plot.background  = element_rect(fill = "black", colour = NA),
                   panel.background = element_rect(fill = "black", colour = NA))
-        ggsave(outfile, blank, width = 8, height = 8, device = "svg")
+        ggsave(outfile, blank, width = 12, height = 8, device = "svg")
         return(invisible(NULL))
     }
     p <- ggplot(data, aes(x = x, y = y, fill = .data[[value_col]])) +
         geom_tile() +
         scale_fill_gradientn(
             colours = fill_palette,
-            trans = "log10",
-            name = "nFrags\n(log10)",
+            name = "nFrags",
             na.value = "black"
         ) +
         coord_fixed(xlim = c(XMIN, XMAX), ylim = c(YMIN, YMAX), expand = FALSE) +
@@ -78,11 +77,13 @@ plot_tile <- function(data, value_col, title, outfile) {
             plot.title        = element_text(hjust = 0.5, colour = "white"),
             legend.text       = element_text(colour = "white"),
             legend.title      = element_text(colour = "white"),
-            legend.position   = "right",
-            axis.text         = element_blank(),
-            axis.ticks        = element_blank()
+            legend.position   = "right"
         )
-    ggsave(outfile, p, width = 8, height = 8, device = "svg")
+    # width=12, height=8 keeps the 23520x23520 square plot panel (constrained
+    # by coord_fixed) and reserves ~4 inches of width for the legend outside
+    # the data area. Browser scales preserve aspect, producing a ~2/3 visual
+    # height vs the previous 8x8 (square).
+    ggsave(outfile, p, width = 12, height = 8, device = "svg")
     message(sprintf("[plot_tile] saved %s (n=%d)", outfile, nrow(data)))
 }
 

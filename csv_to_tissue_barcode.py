@@ -33,11 +33,14 @@ def main() -> int:
     valid_barcodes = 0
     excluded_rows = 0
     excluded_blacklist_rows = 0
+    raw_total = 0
+    blacklist_total = 0
     tissue_nfrags: list[int] = []
 
     with open(args.input, "r", encoding="utf-8", newline="") as fin:
         reader = csv.DictReader(fin)
-        required = {"CB", "in_tissue", "nFrags_filtered", "nFrags_chrM", "nFrags_blacklist"}
+        required = {"CB", "in_tissue", "nFrags_filtered", "nFrags_chrM",
+                    "nFrags_blacklist", "nFrags_raw"}
         missing = required - set(reader.fieldnames or [])
         if missing:
             print(f"[ERROR] Missing columns in {args.input}: {sorted(missing)}", file=sys.stderr)
@@ -53,10 +56,13 @@ def main() -> int:
                     nf = int(row["nFrags_filtered"])
                     nc = int(row["nFrags_chrM"])
                     nb = int(row["nFrags_blacklist"])
+                    nr = int(row["nFrags_raw"])
                 except (TypeError, ValueError):
                     continue
                 excluded_rows += nc
                 excluded_blacklist_rows += nb
+                raw_total += nr
+                blacklist_total += nb
                 if row["in_tissue"].strip().lower() == "true":
                     valid_barcodes += 1
                     tissue_nfrags.append(nf)
@@ -67,6 +73,9 @@ def main() -> int:
 
     med = median(tissue_nfrags) if tissue_nfrags else 0
     blacklist_label = args.blacklist if args.blacklist else "none"
+    # Global blacklist ratio: bin-independent (sum over all CBs of the same raw
+    # fragment set). Written as a 0–1 ratio; renderer scales to percent.
+    blacklist_ratio = (blacklist_total / raw_total) if raw_total > 0 else 0.0
     with open(args.summary, "w", encoding="utf-8") as f:
         f.write("metric\tvalue\n")
         f.write(f"bin_size\t{args.bin_size}\n")
@@ -77,6 +86,7 @@ def main() -> int:
         f.write(f"excluded_rows\t{excluded_rows}\n")
         f.write(f"blacklist\t{blacklist_label}\n")
         f.write(f"excluded_blacklist_rows\t{excluded_blacklist_rows}\n")
+        f.write(f"blacklist_ratio\t{blacklist_ratio:.6f}\n")
 
     print(args.output)
     return 0

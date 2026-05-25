@@ -86,6 +86,22 @@ frags <- CreateFragmentObject(path = fragpath, cells = barcodes, validate.fragme
 peaks <- CallPeaks(frags)
 saveRDS(peaks, file.path(outdir, paste0(sample_name, "_peaks.rds")))
 
+#peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+if (GENOME == "mm10") {
+    data(blacklist_mm10, package = "Signac")
+    blacklist_gr <- blacklist_mm10
+} else if (GENOME == "hg38") {
+    data(blacklist_hg38_unified, package = "Signac")
+    blacklist_gr <- blacklist_hg38_unified
+} else {
+    blacklist_gr <- NULL
+}
+if (!is.null(blacklist_gr)) {
+    peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_gr, invert = TRUE)
+}
+peaks <- dropSeqlevels(peaks, c("chrM"), pruning.mode = "coarse")
+peaks <- dropSeqlevels(peaks, c("chrM"), pruning.mode = "coarse")
+
 counts <- FeatureMatrix(fragments = frags, features = peaks, cells = barcodes)
 
 chrom_assay <- CreateChromatinAssay(
@@ -188,8 +204,9 @@ tryCatch({
         scale_fill_manual(values = cluster_pal) +
         theme_void() +
         coord_fixed() +
-        theme(text = element_text(size = 16))
-
+        theme(text = element_text(size = 16),
+        legend.position = "none") 
+        
     cluster_plot <- p_umap + p_spatial
     plot_file <- file.path(outdir, paste0(sample_name, "_clusters_res", res_str, ".svg"))
     ggsave(plot_file, cluster_plot, width = 12, height = 6, device = "svg")
@@ -239,7 +256,7 @@ p1 <- ggplot()+
 geom_violin(data=pbmc@meta.data,aes(x=orig.ident,y=nFrags),color='black',fill='#5A8100',width=1,lwd=0.5,show.legend = F)+
 geom_boxplot(data=pbmc@meta.data,aes(x=orig.ident,y=nFrags),color='black',fill='white',lwd=0.5,width=0.3,outlier.shape = NA,show.legend = F)+
 theme_classic()+
-theme(text=element_text(size=16))+
+theme(text=element_text(size=25))+
 theme(axis.title.x=element_blank())+
 ggtitle(median(pbmc@meta.data$nFrags))
 
@@ -247,34 +264,37 @@ p2 <- ggplot()+
 geom_violin(data=pbmc@meta.data,aes(x=orig.ident,y=TSS.enrichment),color='black',fill='#178CA4',width=1,lwd=0.5,show.legend = F)+
 geom_boxplot(data=pbmc@meta.data,aes(x=orig.ident,y=TSS.enrichment),color='black',fill='white',lwd=0.5,width=0.3,outlier.shape = NA,show.legend = F)+
 theme_classic()+
-theme(text=element_text(size=16))+
+theme(text=element_text(size=25))+
 theme(axis.title.x=element_blank())+
 ggtitle(round(median(pbmc@meta.data$TSS.enrichment), 2))
 
 p3 <- ggplot()+
-geom_violin(data=pbmc@meta.data,aes(x=orig.ident,y=FRiP*100),color='black',fill='#FFB400',width=1,lwd=0.5,show.legend = F)+
-geom_boxplot(data=pbmc@meta.data,aes(x=orig.ident,y=FRiP*100),color='black',fill='white',lwd=0.5,width=0.3,outlier.shape = NA,show.legend = F)+
+geom_violin(data=pbmc@meta.data,aes(x=orig.ident,y=FRiP),color='black',fill='#FFB400',width=1,lwd=0.5,show.legend = F)+
+geom_boxplot(data=pbmc@meta.data,aes(x=orig.ident,y=FRiP),color='black',fill='white',lwd=0.5,width=0.3,outlier.shape = NA,show.legend = F)+
 theme_classic()+
-theme(text=element_text(size=16))+
+theme(text=element_text(size=25))+
 theme(axis.title.x=element_blank())+
 ggtitle(paste0(round(median(pbmc@meta.data$FRiP)*100, 1), "%"))
 
-p4 <- ggplot()+
-geom_violin(data=pbmc@meta.data,aes(x=orig.ident,y=blacklist_ratio*100),color='black',fill='#FF6C02',width=1,lwd=0.5,show.legend = F)+
-geom_boxplot(data=pbmc@meta.data,aes(x=orig.ident,y=blacklist_ratio*100),color='black',fill='white',lwd=0.5,width=0.3,outlier.shape = NA,show.legend = F)+
-theme_classic()+
-theme(text=element_text(size=16))+
-theme(axis.title.x=element_blank())+
-ggtitle(paste0(round(median(pbmc@meta.data$blacklist_ratio)*100, 2), "%"))
+#p4 <- ggplot()+
+#geom_violin(data=pbmc@meta.data,aes(x=orig.ident,y=blacklist_ratio*100),color='black',fill='#FF6C02',width=1,lwd=0.5,show.legend = F)+
+#geom_boxplot(data=pbmc@meta.data,aes(x=orig.ident,y=blacklist_ratio*100),color='black',fill='white',lwd=0.5,width=0.3,outlier.shape = NA,show.legend = F)+
+#theme_classic()+
+#theme(text=element_text(size=16))+
+#theme(axis.title.x=element_blank())+
+#ggtitle(paste0(round(median(pbmc@meta.data$blacklist_ratio)*100, 2), "%"))
 
-qc_violin_plot <- p1 + p2 + p3 + p4 + plot_layout(ncol = 4)
+#qc_violin_plot <- p1 + p2 + p3 + p4 + plot_layout(ncol = 4)
+qc_violin_plot <- p1 + p2 + p3 + 
+  plot_layout(ncol = 3) & 
+  theme(plot.margin = margin(2,20, 2, 20))# 上下5，左右15（单位：pt）
 tryCatch({
-    ggsave(file.path(outdir, paste0(sample_name, "_qc_violin.svg")), qc_violin_plot, width = 16, height = 4, device = "svg")
+    ggsave(file.path(outdir, paste0(sample_name, "_qc_violin.svg")), qc_violin_plot, width = 16, height = 6, device = "svg")
     message("[Signac] QC violin plot saved")
 }, error = function(e) {
     message("[Signac] Warning: QC violin plot failed: ", e$message)
     blank <- ggplot() + annotate("text", x=0.5, y=0.5, label="QC plot failed") + theme_void()
-    ggsave(file.path(outdir, paste0(sample_name, "_qc_violin.svg")), blank, width = 16, height = 4, device = "svg")
+    ggsave(file.path(outdir, paste0(sample_name, "_qc_violin.svg")), blank, width = 16, height = 6, device = "svg")
 })
 
 tryCatch({
@@ -304,80 +324,51 @@ tryCatch({
     ggsave(file.path(outdir, paste0(sample_name, "_tss_scatter.svg")), blank, width = 6, height = 6, device = "svg")
 })
 
-# Fragment size distribution: data is consumed by render_final_report.py via
-# ECharts (responsive to container size), so we emit CSV + JS data files only —
-# no static SVG (the previous SVG distorted at non-default aspect ratios).
-threads <- WORKERS
-cmd <- paste0("pigz -dc -p ", threads, " ", fragpath,
-  " | awk '$1 != \"chrM\" && $3-$2 <= 750 && $3-$2 > 0 { counts[$3-$2]++ } END { for (i=1; i<=750; i++) print i, counts[i]+0 }'")
-size_df <- fread(cmd = cmd, col.names = c("size", "count"))
-size_df[, percentage := (count / sum(count)) * 100]
-write.csv(size_df, file.path(outdir, paste0(sample_name, "_fragment_size.csv")), row.names = FALSE)
-nfrags_total <- sum(size_df$count)
-nfrags_nfr <- sum(size_df[size < 147]$count)
-nfrags_mono <- sum(size_df[size >= 147 & size < 294]$count)
-nfrags_multi <- sum(size_df[size >= 294]$count)
-fraction_nfr <- ifelse(nfrags_total > 0, nfrags_nfr / nfrags_total * 100, 0)
-fraction_mono_nucleosome <- ifelse(nfrags_total > 0, nfrags_mono / nfrags_total * 100, 0)
-fraction_multi_nucleosome <- ifelse(nfrags_total > 0, nfrags_multi / nfrags_total * 100, 0)
-
-js_data <- paste0(
-  "var fragmentData = [",
-  paste0(sprintf("{size:%d, percentage:%.2f}", size_df$size, size_df$percentage), collapse = ","),
-  "];"
-)
-
-writeLines(js_data, file.path(outdir, paste0(sample_name, "_fragment_data.js")))
+# Fragment size distribution + nucleosome fractions are now computed once
+# at merge stage by scripts/compute_fragment_size.py (bin-independent) — no
+# longer recomputed per bin here.
 
 tryCatch({
-    p7 <- ggplot()+
-    geom_tile(data=pbmc@meta.data,aes(x=coor_x,y=coor_y,fill=nFrags))+
-    scale_fill_gradientn(colours = rainbow(6))+
-    theme_void()+
-    coord_fixed()+
-    theme(text=element_text(size=16))
-    p8 <- ggplot()+
-    geom_tile(data=pbmc@meta.data,aes(x=coor_x,y=coor_y,fill=TSS.enrichment))+
-    scale_fill_gradientn(colours = rainbow(6))+
-    theme_void()+
-    coord_fixed()+
-    theme(text=element_text(size=16))
-
-    ggsave(file.path(outdir, paste0(sample_name, "_spatial_qc.svg")), p7 + p8, width = 12, height = 6, device = "svg")
-    # Also emit a standalone TSS spatial map for the report's section-4 dropdown
-    # (model0525 template: "bins_under_tissue_TSS.svg" option).
-    ggsave(file.path(outdir, paste0(sample_name, "_bins_under_tissue_TSS.svg")), p8, width = 8, height = 8, device = "svg")
-    message("[Signac] Spatial QC plot saved")
+    SPATIAL_LIM <- 23520
+    spatial_palette <- c(
+        "#0E458F", "#0F5298", "#0E6BA8", "#0C86B8", "#3399A1", "#3B9C9C",
+        "#B2C061", "#F2CE38", "#F2AB38", "#F2AB38", "#EB7232", "#E65B2E",
+        "#E14428", "#DC2E22", "#DB2921", "#CC2623"
+    )
+    spatial_theme <- theme_void() + theme(
+        plot.background   = element_rect(fill = "black", colour = NA),
+        panel.background  = element_rect(fill = "black", colour = NA),
+        legend.background = element_rect(fill = "black", colour = NA),
+        legend.key        = element_rect(fill = "black", colour = NA),
+        text              = element_text(colour = "white", size = 14),
+        plot.title        = element_text(hjust = 0.5, colour = "white"),
+        legend.text       = element_text(colour = "white"),
+        legend.title      = element_text(colour = "white"),
+        legend.position   = "right"
+    )
+    # Standalone TSS spatial map for the report Section-4 dropdown. Matches
+    # plot_spatial_tiles.R framing: fixed 0..23520 box, no log transform,
+    # legend rendered outside the plot area (width=12 vs height=8).
+    p8 <- ggplot(pbmc@meta.data, aes(x = coor_x, y = coor_y, fill = TSS.enrichment)) +
+        geom_tile() +
+        scale_fill_gradientn(colours = spatial_palette, name = "TSS\nenrichment",
+                             na.value = "black") +
+        coord_fixed(xlim = c(0, SPATIAL_LIM), ylim = c(0, SPATIAL_LIM), expand = FALSE) +
+        labs(title = "Bins under tissue - TSS enrichment") +
+        spatial_theme
+    ggsave(file.path(outdir, paste0(sample_name, "_bins_under_tissue_TSS.svg")),
+           p8, width = 12, height = 8, device = "svg")
+    message("[Signac] TSS spatial plot saved")
 }, error = function(e) {
-    message("[Signac] Warning: Spatial QC plot failed: ", e$message)
-    blank <- ggplot() + annotate("text", x=0.5, y=0.5, label="Spatial QC failed") + theme_void()
-    ggsave(file.path(outdir, paste0(sample_name, "_spatial_qc.svg")), blank, width = 12, height = 6, device = "svg")
-    ggsave(file.path(outdir, paste0(sample_name, "_bins_under_tissue_TSS.svg")), blank, width = 8, height = 8, device = "svg")
-})
-
-tryCatch({
-    pre_cmd <- paste0("pigz -dc -p ", WORKERS, " ", fragpath,
-      " | awk 'BEGIN{OFS=\"\\t\"} $1 != \"chrM\" { print $4 }'")
-    pre_dt <- fread(cmd = pre_cmd, header = FALSE, col.names = "CB")
-    pre_dt <- pre_dt[CB != ""]
-    pre_counts <- pre_dt[, .(nFrags = .N), by = CB]
-    pre_counts[, coor_x := suppressWarnings(as.numeric(sapply(CB, function(x) strsplit(x, "_")[[1]][1])))]
-    pre_counts[, coor_y := suppressWarnings(as.numeric(sapply(CB, function(x) strsplit(x, "_")[[1]][2])))]
-    pre_counts <- pre_counts[!is.na(coor_x) & !is.na(coor_y)]
-
-    p_pre <- ggplot(pre_counts) +
-        geom_tile(aes(x = coor_x, y = coor_y, fill = nFrags)) +
-        scale_fill_gradientn(colours = rainbow(6)) +
-        theme_void() + coord_fixed() +
-        theme(text = element_text(size = 16))
-    ggsave(file.path(outdir, paste0(sample_name, "_spatial_qc_pre.svg")), p_pre,
-           width = 6, height = 6, device = "svg")
-    message("[Signac] Pre-cut spatial nFrags plot saved")
-}, error = function(e) {
-    message("[Signac] Warning: Pre-cut spatial plot failed: ", e$message)
-    blank <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Pre-cut spatial failed") + theme_void()
-    ggsave(file.path(outdir, paste0(sample_name, "_spatial_qc_pre.svg")), blank,
-           width = 6, height = 6, device = "svg")
+    message("[Signac] Warning: TSS spatial plot failed: ", e$message)
+    blank <- ggplot() +
+        annotate("text", x = 0.5, y = 0.5, label = "TSS spatial failed",
+                 colour = "white") +
+        theme_void() +
+        theme(plot.background  = element_rect(fill = "black", colour = NA),
+              panel.background = element_rect(fill = "black", colour = NA))
+    ggsave(file.path(outdir, paste0(sample_name, "_bins_under_tissue_TSS.svg")),
+           blank, width = 12, height = 8, device = "svg")
 })
 
 saveRDS(pbmc, file.path(outdir, paste0(sample_name, "_filtered_seurat_object.rds")))
@@ -390,10 +381,7 @@ stats_df <- data.frame(
         "median_nFrags",
         "median_TSS",
         "median_FRiP",
-        "median_blacklist",
-        "fraction_nfr",
-        "fraction_mono_nucleosome",
-        "fraction_multi_nucleosome",
+        #"median_blacklist",
         "n_cells"
     ),
     value = c(
@@ -402,10 +390,7 @@ stats_df <- data.frame(
         round(median(pbmc@meta.data$nFrags, na.rm = TRUE), 0),
         round(median(pbmc@meta.data$TSS.enrichment, na.rm = TRUE), 2),
         round(median(pbmc@meta.data$FRiP, na.rm = TRUE) * 100, 1),
-        round(median(pbmc@meta.data$blacklist_ratio, na.rm = TRUE) * 100, 2),
-        round(fraction_nfr, 2),
-        round(fraction_mono_nucleosome, 2),
-        round(fraction_multi_nucleosome, 2),
+       # round(median(pbmc@meta.data$blacklist_ratio, na.rm = TRUE) * 100, 2),
         ncol(pbmc)
     )
 )
@@ -416,9 +401,6 @@ message(sprintf("[Signac] Analysis complete! Results saved to: %s", outdir))
 message(sprintf("[Signac] - Peaks: %s", file.path(outdir, paste0(sample_name, "_peaks.rds"))))
 message(sprintf("[Signac] - QC violin: %s", file.path(outdir, paste0(sample_name, "_qc_violin.svg"))))
 message(sprintf("[Signac] - TSS scatter: %s", file.path(outdir, paste0(sample_name, "_tss_scatter.svg"))))
-message(sprintf("[Signac] - Fragment size data: %s (CSV) + %s (JS)",
-        file.path(outdir, paste0(sample_name, "_fragment_size.csv")),
-        file.path(outdir, paste0(sample_name, "_fragment_data.js"))))
-message(sprintf("[Signac] - Spatial QC: %s", file.path(outdir, paste0(sample_name, "_spatial_qc.svg"))))
+message(sprintf("[Signac] - TSS spatial: %s", file.path(outdir, paste0(sample_name, "_bins_under_tissue_TSS.svg"))))
 message(sprintf("[Signac] - Cluster plot (res=0.8): %s", file.path(outdir, paste0(sample_name, "_clusters_res0_8.svg"))))
 message(sprintf("[Signac] - Seurat object: %s", file.path(outdir, paste0(sample_name, "_filtered_seurat_object.rds"))))
